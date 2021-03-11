@@ -1,3 +1,5 @@
+ZXHDAUDIO_VERSION := 2
+ccflags-y += -DDEBUG -DZXHDA_PATCH_VERSION=$(ZXHDAUDIO_VERSION)
 # SPDX-License-Identifier: GPL-2.0
 snd-hda-intel-objs := hda_intel.o
 snd-hda-tegra-objs := hda_tegra.o

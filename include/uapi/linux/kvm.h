@@ -486,6 +486,16 @@ struct kvm_dirty_log {
 	};
 };
 
+/* for KVM_GET_PAGE_ENC_BITMAP */
+struct kvm_page_enc_bitmap {
+	__u64 start_gfn;
+	__u64 num_pages;
+	union {
+		void __user *enc_bitmap; /* one bit per page */
+		__u64 padding2;
+	};
+};
+
 /* for KVM_SET_SIGNAL_MASK */
 struct kvm_signal_mask {
 	__u32 len;
@@ -1399,6 +1409,9 @@ struct kvm_enc_region {
 #define KVM_GET_NESTED_STATE         _IOWR(KVMIO, 0xbe, struct kvm_nested_state)
 #define KVM_SET_NESTED_STATE         _IOW(KVMIO,  0xbf, struct kvm_nested_state)
 
+#define KVM_GET_PAGE_ENC_BITMAP	_IOW(KVMIO, 0xc2, struct kvm_page_enc_bitmap)
+#define KVM_SET_PAGE_ENC_BITMAP	_IOW(KVMIO, 0xc3, struct kvm_page_enc_bitmap)
+
 /* Secure Encrypted Virtualization command */
 enum sev_cmd_id {
 	/* Guest initialization commands */
@@ -1428,6 +1441,13 @@ enum sev_cmd_id {
 	/* Guest certificates commands */
 	KVM_SEV_CERT_EXPORT,
 
+	/* GM specific commands */
+	KVM_SEV_GM_GET_DIGEST,
+	KVM_SEV_GM_VERIFY_DIGEST,
+
+	/* Get the number of sev devices */
+	KVM_SEV_GET_SEV_DEV_NUM,
+
 	KVM_SEV_NR_MAX,
 };
 
@@ -1450,6 +1470,45 @@ struct kvm_sev_launch_start {
 struct kvm_sev_launch_update_data {
 	__u64 uaddr;
 	__u32 len;
+};
+
+struct kvm_sev_send_start {
+	__u32 policy;					/* Out */
+	__u64 pdh_cert_data;			/* In */
+	__u32 pdh_cert_length;			/* In */
+	__u64 plat_cert_data;			/* In */
+	__u32 plat_cert_length;			/* In */
+	__u64 vendor_cert_data;			/* In */
+	__u32 vendor_cert_length;		/* In */
+	__u64 session_data;				/* In */
+	__u32 session_length;			/* In/Out */
+};
+
+struct kvm_sev_send_update_data {
+	__u64 hdr_data;
+	__u32 hdr_length;
+	__u64 guest_address;
+	__u32 guest_length;
+	__u64 trans_address;
+	__u32 trans_length;
+};
+
+struct kvm_sev_receive_start {
+	__u32 handle;
+	__u32 policy;
+	__u64 dh_uaddr;
+	__u32 dh_len;
+	__u64 session_uaddr;
+	__u32 session_len;
+};
+
+struct kvm_sev_receive_update_data {
+	__u64 hdr_data;
+	__u32 hdr_length;
+	__u64 guest_address;
+	__u32 guest_length;
+	__u64 trans_address;
+	__u32 trans_length;
 };
 
 
@@ -1478,6 +1537,41 @@ struct kvm_sev_dbg {
 	__u64 dst_uaddr;
 	__u32 len;
 };
+
+struct kvm_sev_gm_get_digest {
+	__u64 uaddr;
+	__u32 len;
+};
+
+struct kvm_sev_gm_verify_digest {
+	__u64 uaddr;
+	__u32 len;
+};
+
+struct kvm_sev_multi_data_info_item {
+	__u64 guest_hva;
+	__u64 guest_gpa;
+	__u32 guest_len;
+};
+
+struct kvm_sev_update_data_hdr {
+	__u32 flags;
+	union {
+		struct {
+			__u8 iv[16];
+			__u8 mac[32];
+		};
+		struct {
+			__u32 item_num;
+			__u64 iv_array_addr;
+			__u32 iv_array_len;
+			__u64 mac_array_addr;
+			__u32 mac_array_len;
+		};
+	};
+	__u32 info_len;
+	__u64 info;
+} __attribute__((__packed__));
 
 #define KVM_DEV_ASSIGN_ENABLE_IOMMU	(1 << 0)
 #define KVM_DEV_ASSIGN_PCI_2_3		(1 << 1)

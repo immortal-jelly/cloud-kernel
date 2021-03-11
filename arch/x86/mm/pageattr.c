@@ -2091,6 +2091,12 @@ int set_memory_global(unsigned long addr, int numpages)
 				    __pgprot(_PAGE_GLOBAL), 0);
 }
 
+void __attribute__((weak)) set_memory_enc_dec_hypercall(unsigned long addr,
+							unsigned long size,
+							bool enc)
+{
+}
+
 static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc)
 {
 	struct cpa_data cpa;
@@ -2139,6 +2145,14 @@ static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc)
 		cpa_flush_range(start, numpages, 0);
 	else
 		cpa_flush_all(0);
+
+	/*
+	 * When SEV is active, notify hypervisor that a given memory range is mapped
+	 * encrypted or decrypted. Hypervisor will use this information during
+	 * the VM migration.
+	 */
+	if (sev_active())
+		set_memory_enc_dec_hypercall(addr, numpages << PAGE_SHIFT, enc);
 
 	return ret;
 }

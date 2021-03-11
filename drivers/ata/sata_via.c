@@ -45,7 +45,7 @@
 #include <linux/libata.h>
 
 #define DRV_NAME	"sata_via"
-#define DRV_VERSION	"2.6"
+#define DRV_VERSION	"2.6.1"
 
 /*
  * vt8251 is different from other sata controllers of VIA.  It has two
@@ -55,6 +55,7 @@ enum board_ids_enum {
 	vt6420,
 	vt6421,
 	vt8251,
+	cnd001,
 };
 
 enum {
@@ -92,6 +93,9 @@ static int svia_scr_read(struct ata_link *link, unsigned int sc_reg, u32 *val);
 static int svia_scr_write(struct ata_link *link, unsigned int sc_reg, u32 val);
 static int vt8251_scr_read(struct ata_link *link, unsigned int scr, u32 *val);
 static int vt8251_scr_write(struct ata_link *link, unsigned int scr, u32 val);
+static int cnd001_scr_read(struct ata_link *link, unsigned int scr, u32 *val);
+static int cnd001_scr_write(struct ata_link *link, unsigned int scr, u32 val);
+
 static void svia_tf_load(struct ata_port *ap, const struct ata_taskfile *tf);
 static void svia_noop_freeze(struct ata_port *ap);
 static int vt6420_prereset(struct ata_link *link, unsigned long deadline);
@@ -110,6 +114,11 @@ static const struct pci_device_id svia_pci_tbl[] = {
 	{ PCI_VDEVICE(VIA, 0x7372), vt6420 },
 	{ PCI_VDEVICE(VIA, 0x5287), vt8251 }, /* 2 sata chnls (Master/Slave) */
 	{ PCI_VDEVICE(VIA, 0x9000), vt8251 },
+ 
+	{ PCI_VDEVICE(VIA, 0x9002), cnd001 },
+	{ PCI_VDEVICE(VIA, 0x9003), cnd001 },
+	{ PCI_VDEVICE(ZX, 0x9002), cnd001 },
+	{ PCI_VDEVICE(ZX, 0x9003), cnd001 },
 
 	{ }	/* terminate list */
 };
@@ -177,6 +186,13 @@ static const struct ata_port_info vt6421_sport_info = {
 	.udma_mask	= ATA_UDMA6,
 	.port_ops	= &vt6421_sata_ops,
 };
+ 
+static struct ata_port_operations cnd001_ops = {
+	.inherits		= &svia_base_ops,
+	.hardreset		= sata_std_hardreset,
+	.scr_read		= cnd001_scr_read,
+	.scr_write		= cnd001_scr_write,
+};
 
 static const struct ata_port_info vt6421_pport_info = {
 	.flags		= ATA_FLAG_SLAVE_POSS,
@@ -192,6 +208,14 @@ static const struct ata_port_info vt8251_port_info = {
 	.mwdma_mask	= ATA_MWDMA2,
 	.udma_mask	= ATA_UDMA6,
 	.port_ops	= &vt8251_ops,
+};
+ 
+static struct ata_port_info cnd001_port_info = {
+	.flags		= ATA_FLAG_SATA |ATA_FLAG_SLAVE_POSS,
+	.pio_mask	= ATA_PIO4,
+	.mwdma_mask	= ATA_MWDMA2,
+	.udma_mask	= ATA_UDMA6,
+	.port_ops	= &cnd001_ops,
 };
 
 MODULE_AUTHOR("Jeff Garzik");
@@ -286,6 +310,88 @@ static int vt8251_scr_write(struct ata_link *link, unsigned int scr, u32 val)
 		v |= ((val >> 8) & 0x3) << 2;
 
 		pci_write_config_byte(pdev, 0xA4 + slot, v);
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
+}
+ 
+static int cnd001_scr_read(struct ata_link *link, unsigned int scr, u32 *val)
+{
+	static const u8 ipm_tbl[] = { 1, 2, 6, 0 };
+	struct pci_dev *pdev = to_pci_dev(link->ap->host->dev);
+	int slot = 2 * link->ap->port_no + link->pmp;
+	u32 v = 0;
+	u8 raw;
+
+	switch (scr) {
+	case SCR_STATUS:
+		pci_read_config_byte(pdev, 0xA0 + slot, &raw);
+
+		/* read the DET field, bit0 and 1 of the config byte */
+		v |= raw & 0x03;
+
+		/* read the SPD field, bit4 of the configure byte */
+		v |= raw & 0x30;
+
+		/* read the IPM field, bit2 and 3 of the config byte */
+		v |= ((ipm_tbl[(raw >> 2) & 0x3])<<8);
+		break;
+
+	case SCR_ERROR:
+		/* devices other than 5287 uses 0xA8 as base */
+		WARN_ON(pdev->device != 0x9002 && pdev->device != 0x9003);
+		pci_write_config_byte(pdev, 0x42 ,slot);
+		pci_read_config_dword(pdev, 0xA8, &v);
+		break;
+
+	case SCR_CONTROL:
+		pci_read_config_byte(pdev, 0xA4 + slot, &raw);
+
+		/* read the DET field, bit0 and bit1 */
+		v |= ((raw & 0x02) << 1) | (raw & 0x01);
+
+		/* read the IPM field, bit2 and bit3 */
+		v |= ((raw >> 2) & 0x03) << 8;
+
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	*val = v;
+	return 0;
+}
+
+static int cnd001_scr_write(struct ata_link *link, unsigned int scr, u32 val)
+{
+	struct pci_dev *pdev = to_pci_dev(link->ap->host->dev);
+	int slot = 2 * link->ap->port_no + link->pmp;
+	u32 v = 0;
+
+	WARN_ON(pdev == NULL);
+
+	switch (scr) {
+	case SCR_ERROR:
+		/* devices 0x9002 uses 0xA8 as base */
+		WARN_ON(pdev->device != 0x9002 && pdev->device != 0x9003);
+		pci_write_config_byte(pdev, 0x42, slot);
+		pci_write_config_dword(pdev, 0xA8, val);
+		return 0;
+
+	case SCR_CONTROL:
+		/* set the DET field */
+		v |= ((val & 0x4) >> 1) | (val & 0x1);
+
+		/* set the IPM field */
+		v |= ((val >> 8) & 0x3) << 2;
+
+		
+		pci_write_config_byte(pdev, 0xA4 + slot, v);
+
+	
 		return 0;
 
 	default:
@@ -439,6 +545,14 @@ static const unsigned int svia_bar_sizes[] = {
 
 static const unsigned int vt6421_bar_sizes[] = {
 	16, 16, 16, 16, 32, 128
+};
+ 
+static const unsigned int cnd001_bar_sizes0[] = {
+	8, 4, 8, 4, 16, 0
+};
+
+static const unsigned int cnd001_bar_sizes1[] = {
+	8, 4, 0, 0, 16, 0
 };
 
 static void __iomem *svia_scr_addr(void __iomem *addr, unsigned int port)
@@ -615,6 +729,32 @@ static void vt6421_error_handler(struct ata_port *ap)
 
 	ata_sff_error_handler(ap);
 }
+ 
+static int cnd001_prepare_host(struct pci_dev *pdev, struct ata_host **r_host)
+{
+	const struct ata_port_info *ppi0[] = { &cnd001_port_info, NULL };
+	const struct ata_port_info *ppi1[] = { &cnd001_port_info, &ata_dummy_port_info};
+	struct ata_host *host;
+	int i, rc;
+
+	if (pdev->device == 0x9002)
+		rc = ata_pci_bmdma_prepare_host(pdev, ppi0, &host);
+	else if (pdev->device == 0x9003)
+		rc = ata_pci_bmdma_prepare_host(pdev, ppi1, &host);
+	else
+		rc = -EINVAL ;
+	if (rc)
+		return rc;
+	*r_host = host;
+
+
+	/* cnd001 9002 hosts four sata ports as M/S of the two channels */
+	/* cnd001 9003 hosts two sata ports as M/S of the one channel */
+	for (i = 0; i < host->n_ports; i++)
+		ata_slave_link_init(host->ports[i]);
+
+	return 0;
+}
 
 static void svia_configure(struct pci_dev *pdev, int board_id,
 			   struct svia_priv *hpriv)
@@ -706,8 +846,23 @@ static int svia_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	int board_id = (int) ent->driver_data;
 	const unsigned *bar_sizes;
 	struct svia_priv *hpriv;
+	int legacy_mode =0;
 
 	ata_print_version_once(&pdev->dev, DRV_VERSION);
+ 
+	if (pdev->device == 0x9002 || pdev->device == 0x9003){
+		if ((pdev->class >> 8) == PCI_CLASS_STORAGE_IDE) {
+			u8 tmp8, mask;
+
+			/* TODO: What if one channel is in native mode ... */
+			pci_read_config_byte(pdev, PCI_CLASS_PROG, &tmp8);
+			mask = (1 << 2) | (1 << 0);
+			if ((tmp8 & mask) != mask)
+				legacy_mode = 1;
+		}
+		if(legacy_mode)
+			return -EINVAL ;
+	}
 
 	rc = pcim_enable_device(pdev);
 	if (rc)
@@ -715,12 +870,18 @@ static int svia_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	if (board_id == vt6421)
 		bar_sizes = &vt6421_bar_sizes[0];
+	else if(board_id == cnd001 && pdev->device == 0x9002)
+		bar_sizes = &cnd001_bar_sizes0[0];
+	else if(board_id == cnd001 && pdev->device == 0x9003)
+		bar_sizes = &cnd001_bar_sizes1[0];
 	else
 		bar_sizes = &svia_bar_sizes[0];
 
 	for (i = 0; i < ARRAY_SIZE(svia_bar_sizes); i++)
 		if ((pci_resource_start(pdev, i) == 0) ||
 		    (pci_resource_len(pdev, i) < bar_sizes[i])) {
+		    if(bar_sizes[i]==0)
+				continue;
 			dev_err(&pdev->dev,
 				"invalid PCI BAR %u (sz 0x%llx, val 0x%llx)\n",
 				i,
@@ -739,6 +900,9 @@ static int svia_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	case vt8251:
 		rc = vt8251_prepare_host(pdev, &host);
 		break;
+	case cnd001:
+		rc = cnd001_prepare_host(pdev, &host);
+		break;		
 	default:
 		rc = -EINVAL;
 	}

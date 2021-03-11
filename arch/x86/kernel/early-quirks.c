@@ -60,7 +60,7 @@ static void __init via_bugs(int  num, int slot, int func)
 	if ((max_pfn > MAX_DMA32_PFN ||  force_iommu) &&
 	    !gart_iommu_aperture_allowed) {
 		printk(KERN_INFO
-		       "Looks like a VIA chipset. Disabling IOMMU."
+		       "On this chipset. Disabling IOMMU."
 		       " Override with iommu=allowed\n");
 		gart_iommu_aperture_disabled = 1;
 	}

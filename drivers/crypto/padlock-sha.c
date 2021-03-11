@@ -539,7 +539,7 @@ static int __init padlock_init(void)
 	if (rc)
 		goto out_unreg1;
 
-	printk(KERN_NOTICE PFX "Using VIA PadLock ACE for SHA1/SHA256 algorithms.\n");
+	printk(KERN_NOTICE PFX "Using PadLock ACE for SHA1/SHA256 algorithms.\n");
 
 	return 0;
 
@@ -547,7 +547,7 @@ out_unreg1:
 	crypto_unregister_shash(sha1);
 
 out:
-	printk(KERN_ERR PFX "VIA PadLock SHA1/SHA256 initialization failed.\n");
+	printk(KERN_ERR PFX "PadLock SHA1/SHA256 initialization failed.\n");
 	return rc;
 }
 
@@ -567,7 +567,7 @@ static void __exit padlock_fini(void)
 module_init(padlock_init);
 module_exit(padlock_fini);
 
-MODULE_DESCRIPTION("VIA PadLock SHA1/SHA256 algorithms support.");
+MODULE_DESCRIPTION("PadLock SHA1/SHA256 algorithms support.");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Michal Ludvig");
 

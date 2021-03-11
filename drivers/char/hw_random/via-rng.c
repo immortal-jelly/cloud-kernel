@@ -176,7 +176,7 @@ static int via_rng_init(struct hwrng *rng)
 	   unneeded */
 	rdmsr(MSR_VIA_RNG, lo, hi);
 	if ((lo & VIA_RNG_ENABLE) == 0) {
-		pr_err(PFX "cannot enable VIA C3 RNG, aborting\n");
+		pr_err(PFX "cannot enable RNG, aborting\n");
 		return -ENODEV;
 	}
 
@@ -185,7 +185,7 @@ static int via_rng_init(struct hwrng *rng)
 
 
 static struct hwrng via_rng = {
-	.name		= "via",
+	.name		= "hw-rng",
 	.init		= via_rng_init,
 	.data_present	= via_rng_data_present,
 	.data_read	= via_rng_data_read,
@@ -199,7 +199,7 @@ static int __init mod_init(void)
 	if (!boot_cpu_has(X86_FEATURE_XSTORE))
 		return -ENODEV;
 
-	pr_info("VIA RNG detected\n");
+	pr_info("RNG detected\n");
 	err = hwrng_register(&via_rng);
 	if (err) {
 		pr_err(PFX "RNG registering failed (%d)\n",
@@ -223,6 +223,6 @@ static struct x86_cpu_id __maybe_unused via_rng_cpu_id[] = {
 	{}
 };
 
-MODULE_DESCRIPTION("H/W RNG driver for VIA CPU with PadLock");
+MODULE_DESCRIPTION("H/W RNG driver for CPU with PadLock");
 MODULE_LICENSE("GPL");
 MODULE_DEVICE_TABLE(x86cpu, via_rng_cpu_id);

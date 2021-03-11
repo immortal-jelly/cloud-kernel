@@ -48,6 +48,7 @@ struct psp_device {
 	struct list_head entry;
 
 	struct psp_vdata *vdata;
+	unsigned int id;
 	char name[MAX_PSP_NAME_LEN];
 
 	struct device *dev;
@@ -64,7 +65,7 @@ struct psp_device {
 
 	u8 api_major;
 	u8 api_minor;
-	u8 build;
+	u32 build;
 };
 
 #endif /* __PSP_DEV_H */

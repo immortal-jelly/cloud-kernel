@@ -39,7 +39,7 @@
 #include <asm/processor.h>
 #include <asm/cpu_device_id.h>
 
-#define DRVNAME	"via_cputemp"
+#define DRVNAME	"cputemp"
 
 enum { SHOW_TEMP, SHOW_LABEL, SHOW_NAME };
 
@@ -134,7 +134,7 @@ static int via_cputemp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	data->id = pdev->id;
-	data->name = "via_cputemp";
+	data->name = "cputemp";
 
 	if (c->x86 == 7) {
 		data->msr_temp = 0x1423;
@@ -305,7 +305,7 @@ static int __init via_cputemp_init(void)
 	if (err)
 		goto exit;
 
-	err = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "hwmon/via:online",
+	err = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "hwmon:online",
 				via_cputemp_online, via_cputemp_down_prep);
 	if (err < 0)
 		goto exit_driver_unreg;
@@ -336,7 +336,7 @@ static void __exit via_cputemp_exit(void)
 }
 
 MODULE_AUTHOR("Harald Welte <HaraldWelte@viatech.com>");
-MODULE_DESCRIPTION("VIA CPU temperature monitor");
+MODULE_DESCRIPTION("CPU temperature monitor");
 MODULE_LICENSE("GPL");
 
 module_init(via_cputemp_init)

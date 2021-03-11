@@ -69,6 +69,9 @@ static void init_c3(struct cpuinfo_x86 *c)
 #endif
 	if (c->x86 == 0x6 && c->x86_model >= 0xf) {
 		c->x86_cache_alignment = c->x86_clflush_size * 2;
+	}
+
+	if ((c->x86 == 0x6 && c->x86_model >= 0xf) || (c->x86 > 0x6)) {
 		set_cpu_cap(c, X86_FEATURE_REP_GOOD);
 	}
 
@@ -96,8 +99,12 @@ enum {
 		EAMD3D		= 1<<20,
 };
 
+#define ZX_PATCH_VERSION "V3.0.2"
+
 static void early_init_centaur(struct cpuinfo_x86 *c)
 {
+	pr_info_once("Zhaoxin Linux Patch Version is %s \n", ZX_PATCH_VERSION);
+	printk(KERN_INFO"With Zhaoxin Shanghai CPU patch V2.0.0\n");
 	switch (c->x86) {
 #ifdef CONFIG_X86_32
 	case 5:
@@ -109,6 +116,9 @@ static void early_init_centaur(struct cpuinfo_x86 *c)
 		if (c->x86_model >= 0xf)
 			set_cpu_cap(c, X86_FEATURE_CONSTANT_TSC);
 		break;
+	case 7:
+		set_cpu_cap(c, X86_FEATURE_CONSTANT_TSC);
+		break;
 	}
 #ifdef CONFIG_X86_64
 	set_cpu_cap(c, X86_FEATURE_SYSENTER32);
@@ -116,6 +126,19 @@ static void early_init_centaur(struct cpuinfo_x86 *c)
 	if (c->x86_power & (1 << 8)) {
 		set_cpu_cap(c, X86_FEATURE_CONSTANT_TSC);
 		set_cpu_cap(c, X86_FEATURE_NONSTOP_TSC);
+	}
+	
+	if (c->cpuid_level >= 0x00000001) {
+		u32 eax, ebx, ecx, edx;
+
+		cpuid(0x00000001, &eax, &ebx, &ecx, &edx);
+		/*
+		 * If HTT (EDX[28]) is set EBX[16:23] contain the number of
+		 * apicids which are reserved per package. Store the resulting
+		 * shift value for the package management code.
+		 */
+		if (edx & (1U << 28))
+			c->x86_coreid_bits = get_count_order((ebx >> 16) & 0xff);
 	}
 }
 
@@ -160,11 +183,15 @@ static void init_centaur(struct cpuinfo_x86 *c)
 	clear_cpu_cap(c, 0*32+31);
 #endif
 	early_init_centaur(c);
+	detect_extended_topology(c);
 	init_intel_cacheinfo(c);
-	detect_num_cpu_cores(c);
+	printk(KERN_INFO "Got Zhaoxin CPU topology from cpuid B leaf, 4 leaf patch V1.0.0\n");
+	if (!cpu_has(c, X86_FEATURE_XTOPOLOGY)) {
+		detect_num_cpu_cores(c);
 #ifdef CONFIG_X86_32
-	detect_ht(c);
+		detect_ht(c);
 #endif
+	}
 
 	if (c->cpuid_level > 9) {
 		unsigned int eax = cpuid_eax(10);
@@ -243,6 +270,7 @@ static void init_centaur(struct cpuinfo_x86 *c)
 		break;
 #endif
 	case 6:
+	case 7:
 		init_c3(c);
 		break;
 	}
@@ -286,3 +314,16 @@ static const struct cpu_dev centaur_cpu_dev = {
 };
 
 cpu_dev_register(centaur_cpu_dev);
+
+static const struct cpu_dev zhaoxin_cpu_dev = {
+        .c_vendor       = "Zhaoxin",
+        .c_ident        = { "  Shanghai  " },
+        .c_early_init   = early_init_centaur,
+        .c_init         = init_centaur,
+#ifdef CONFIG_X86_32
+        .legacy_cache_size = centaur_size_cache,
+#endif
+        .c_x86_vendor   = X86_VENDOR_CENTAUR,
+};
+
+cpu_dev_register(zhaoxin_cpu_dev);

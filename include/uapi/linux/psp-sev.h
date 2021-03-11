@@ -32,6 +32,12 @@ enum {
 	SEV_PEK_CERT_IMPORT,
 	SEV_GET_ID,
 
+	SEV_USER_CMD_INIT,
+	SEV_USER_CMD_SHUTDOWN,
+	SEV_GM_PUBKEY_GEN = 31,
+	SEV_USER_CMD_DOWNLOAD_FIRMWARE = 35,
+
+
 	SEV_MAX,
 };
 
@@ -61,6 +67,9 @@ typedef enum {
 	SEV_RET_HWSEV_RET_PLATFORM,
 	SEV_RET_HWSEV_RET_UNSAFE,
 	SEV_RET_UNSUPPORTED,
+	SEV_RET_INVALID_PARAM,
+	SEV_RET_BAD_DIGEST,
+	SEV_RET_INTERNAL_ERROR,
 	SEV_RET_MAX,
 } sev_ret_code;
 
@@ -70,17 +79,34 @@ typedef enum {
  * @major: major API version
  * @minor: minor API version
  * @state: platform state
- * @flags: platform config flags
+ * @owner: self-owned or externally owned
+ * @chip_secure: ES or MP chip
+ * @fw_enc: is this FW is encrypted
+ * @fw_sign: is this FW is signed
+ * @config_es: platform config flags
  * @build: firmware build id for API version
  * @guest_count: number of active guests
+ * @bl_version_debug: Bootloader VERSION_DEBUG field
+ * @bl_version_minor: Bootloader VERSION_MINOR field
+ * @bl_version_major: Bootloader VERSION_MAJOR field
+ * @reserved: should set to zero
  */
 struct sev_user_data_status {
 	__u8 api_major;				/* Out */
 	__u8 api_minor;				/* Out */
 	__u8 state;				/* Out */
-	__u32 flags;				/* Out */
-	__u8 build;				/* Out */
+	__u8 onwer : 1,				/* Out */
+	 chip_secure : 1,			/* Out */
+	 fw_enc : 1,				/* Out */
+	 fw_sign : 1,				/* Out */
+	 reserved1 : 4;				/* reserved */
+	__u32 config_es : 1,			/* Out */
+	 build : 31;				/* Out */
 	__u32 guest_count;			/* Out */
+	__u32 bl_version_debug : 8,		/* Out */
+	 bl_version_minor : 8,			/* Out */
+	 bl_version_major : 8,			/* Out */
+	 reserved2 : 8;				/* reserved */
 } __packed;
 
 /**
@@ -125,14 +151,43 @@ struct sev_user_data_pdh_cert_export {
 } __packed;
 
 /**
- * struct sev_user_data_get_id - GET_ID command parameters
+ * struct csv_user_get_id_cmd_buf - GET_ID command parameters
  *
- * @socket1: Buffer to pass unique ID of first socket
- * @socket2: Buffer to pass unique ID of second socket
+ * @address: the address of id userd for return
+ * @length: the length of id
+ *
  */
-struct sev_user_data_get_id {
-	__u8 socket1[64];			/* Out */
-	__u8 socket2[64];			/* Out */
+struct sev_user_get_id_cmd_buf
+{
+	    __u64    address; /* Out */
+	    __u32    length;  /* In */
+} __packed;
+
+/**
+ * struct sev_user_data_gm_pubkey_gen - GM_PUBKEY_GEN command parameters
+ *
+ * @key_id_address: address of key id
+ * @key_id_len: len of key id
+ * @pubkey_address: address of GM public key
+ * @pubkey_len: len of GM public key
+ */
+struct sev_user_data_gm_pubkey_gen {
+	__u64 key_id_address;		/* In */
+	__u32 key_id_len;			/* In */
+	__u64 pubkey_address;		/* In */
+	__u32 pubkey_len;			/* In/Out */
+}  __attribute__((packed));
+
+/**
+ * struct sev_user_data_download_firmware
+ * DOWNLOAD_FIRMWARE command parameters
+ *
+ * @address: physical address of firmware image
+ * @len: len of the firmware image
+ */
+struct sev_user_data_download_firmware {
+	u64 address;			/* In */
+	u32 len;			/* In */
 } __packed;
 
 /**

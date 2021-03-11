@@ -493,7 +493,7 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
 
 	if (mem_encrypt_active())
 		pr_warn_once("%s is active and system is using DMA bounce buffers\n",
-			     sme_active() ? "SME" : "SEV");
+			     sme_active() ? "SME" : "CSV");
 
 	mask = dma_get_seg_boundary(hwdev);
 

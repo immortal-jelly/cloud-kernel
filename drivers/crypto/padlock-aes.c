@@ -501,7 +501,7 @@ static int __init padlock_init(void)
 		return -ENODEV;
 
 	if (!boot_cpu_has(X86_FEATURE_XCRYPT_EN)) {
-		printk(KERN_NOTICE PFX "VIA PadLock detected, but not enabled. Hmm, strange...\n");
+		printk(KERN_NOTICE PFX "PadLock detected, but not enabled. Hmm, strange...\n");
 		return -ENODEV;
 	}
 
@@ -514,7 +514,7 @@ static int __init padlock_init(void)
 	if ((ret = crypto_register_alg(&cbc_aes_alg)))
 		goto cbc_aes_err;
 
-	printk(KERN_NOTICE PFX "Using VIA PadLock ACE for AES algorithm.\n");
+	printk(KERN_NOTICE PFX "Using PadLock ACE for AES algorithm.\n");
 
 	if (c->x86 == 6 && c->x86_model == 15 && c->x86_stepping == 2) {
 		ecb_fetch_blocks = MAX_ECB_FETCH_BLOCKS;
@@ -530,7 +530,7 @@ cbc_aes_err:
 ecb_aes_err:
 	crypto_unregister_alg(&aes_alg);
 aes_err:
-	printk(KERN_ERR PFX "VIA PadLock AES initialization failed.\n");
+	printk(KERN_NOTICE PFX "Using PadLock ACE for AES algorithm.\n");
 	goto out;
 }
 
@@ -544,7 +544,7 @@ static void __exit padlock_fini(void)
 module_init(padlock_init);
 module_exit(padlock_fini);
 
-MODULE_DESCRIPTION("VIA PadLock AES algorithm support");
+MODULE_DESCRIPTION("PadLock AES algorithm support");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Michal Ludvig");
 

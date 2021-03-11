@@ -32,8 +32,17 @@
 		 (psp_master->api_minor) >= _min)
 
 #define DEVICE_NAME	"sev"
-#define SEV_FW_FILE	"amd/sev.fw"
+#define CSV_FW_FILE	"hygon/csv.fw"
 
+#define __sme_page_pa(x) __sme_set(page_to_pfn(x) << PAGE_SHIFT)
+
+/* List of PSPs, PSP count, read-write access lock, and access functions
+ *
+ * Lock structure: get psp_unit_lock for reading whenever we need to
+ * examine the PSP list.
+ */
+static DEFINE_RWLOCK(psp_unit_lock);
+static LIST_HEAD(psp_units);
 static DEFINE_MUTEX(sev_cmd_mutex);
 static struct sev_misc_dev *misc_dev;
 static struct psp_device *psp_master;
@@ -48,6 +57,8 @@ MODULE_PARM_DESC(psp_probe_timeout, " default timeout value, in seconds, during 
 
 static bool psp_dead;
 static int psp_timeout;
+
+static atomic_t psp_id;
 
 static struct psp_device *psp_alloc_struct(struct sp_device *sp)
 {
@@ -64,6 +75,52 @@ static struct psp_device *psp_alloc_struct(struct sp_device *sp)
 	snprintf(psp->name, sizeof(psp->name), "psp-%u", sp->ord);
 
 	return psp;
+}
+
+static void psp_add_device(struct psp_device *psp)
+{
+	unsigned long flags;
+
+	write_lock_irqsave(&psp_unit_lock, flags);
+
+	list_add_tail(&psp->entry, &psp_units);
+
+	write_unlock_irqrestore(&psp_unit_lock, flags);
+}
+
+static void psp_del_device(struct psp_device *psp)
+{
+	unsigned long flags;
+
+	write_lock_irqsave(&psp_unit_lock, flags);
+
+	list_del(&psp->entry);
+
+	write_unlock_irqrestore(&psp_unit_lock, flags);
+}
+
+static struct psp_device *psp_get_next_device(struct psp_device *psp)
+{
+	unsigned long flags;
+	struct psp_device *dp = NULL;
+
+	/* We retrieve through the unit list.
+	 * The psp pointer refers to the next unit to use.
+	 */
+	read_lock_irqsave(&psp_unit_lock, flags);
+	if (!list_empty(&psp_units)) {
+		dp = psp;
+		if (psp == NULL)
+			dp = list_first_entry(&psp_units, struct psp_device,
+						  entry);
+		else if (list_is_last(&psp->entry, &psp_units))
+			dp = NULL;
+		else
+			dp = list_next_entry(psp, entry);
+	}
+	read_unlock_irqrestore(&psp_unit_lock, flags);
+
+	return dp;
 }
 
 static irqreturn_t psp_irq_handler(int irq, void *data)
@@ -108,6 +165,23 @@ static int sev_wait_cmd_ioc(struct psp_device *psp,
 	return 0;
 }
 
+static void sev_wait_cmd_vec_ioc(unsigned int *reg, unsigned int count)
+{
+	struct psp_device *psp = NULL;
+	unsigned int i = 0;
+
+	psp = psp_get_next_device(NULL);
+	while (psp) {
+		if (!psp->sev_int_rcvd)
+			wait_event(psp->sev_int_queue, psp->sev_int_rcvd);
+		reg[i] = ioread32(psp->io_regs + psp->vdata->cmdresp_reg);
+		i += 1;
+		if (i >= count)
+			break;
+		psp = psp_get_next_device(psp);
+	}
+}
+
 static int sev_cmd_buffer_len(int cmd)
 {
 	switch (cmd) {
@@ -136,8 +210,11 @@ static int sev_cmd_buffer_len(int cmd)
 	case SEV_CMD_RECEIVE_UPDATE_DATA:	return sizeof(struct sev_data_receive_update_data);
 	case SEV_CMD_RECEIVE_UPDATE_VMSA:	return sizeof(struct sev_data_receive_update_vmsa);
 	case SEV_CMD_LAUNCH_UPDATE_SECRET:	return sizeof(struct sev_data_launch_secret);
+	case SEV_CMD_GM_PUBKEY_GEN:		return sizeof(struct sev_data_gm_pubkey_gen);
+	case SEV_CMD_GM_GET_DIGEST:		return sizeof(struct sev_data_gm_get_digest);
+	case SEV_CMD_GM_VERIFY_DIGEST:		return sizeof(struct sev_data_gm_verify_digest);
 	case SEV_CMD_DOWNLOAD_FIRMWARE:		return sizeof(struct sev_data_download_firmware);
-	case SEV_CMD_GET_ID:			return sizeof(struct sev_data_get_id);
+	case SEV_CMD_GET_ID:			return sizeof(struct sev_get_id_cmd_buf);
 	default:				return 0;
 	}
 
@@ -205,12 +282,112 @@ static int __sev_do_cmd_locked(int cmd, void *data, int *psp_ret)
 	return ret;
 }
 
+static int __sev_do_cmd_vec_locked(int cmd, void *data, int len, int *psp_ret)
+{
+	struct psp_device *psp = NULL;
+	unsigned int phys_lsb, phys_msb;
+	unsigned int ret = 0;
+	unsigned int *reg = NULL;
+	int cmd_len;
+	int count, i, step, offset;
+
+	if (!psp_master)
+		return -ENODEV;
+
+	cmd_len = sev_cmd_buffer_len(cmd);
+	if ((len % cmd_len) != 0)
+		return -EINVAL;
+
+	count = len / cmd_len;
+
+	reg = kzalloc(sizeof(unsigned int) * count, GFP_KERNEL);
+	if (!reg)
+		return -ENOMEM;
+
+	for (i = 0; i < count;) {
+		offset = 0;
+		psp = psp_get_next_device(NULL);
+		while (psp) {
+			/* Get the physical address of the command buffer */
+			phys_lsb = data ? lower_32_bits(__psp_pa((uint8_t *)data + (i + offset) * cmd_len)) : 0;
+			phys_msb = data ? upper_32_bits(__psp_pa((uint8_t *)data + (i + offset) * cmd_len)) : 0;
+
+			dev_dbg(psp->dev, "sev command id %#x buffer 0x%08x%08x\n",
+					cmd, phys_msb, phys_lsb);
+
+			print_hex_dump_debug("(in):  ", DUMP_PREFIX_OFFSET, 16, 2,
+								 (uint8_t *)data + (i + offset) * cmd_len,
+								 cmd_len, false);
+
+			iowrite32(phys_lsb, psp->io_regs + psp->vdata->cmdbuff_addr_lo_reg);
+			iowrite32(phys_msb, psp->io_regs + psp->vdata->cmdbuff_addr_hi_reg);
+
+			reg[i + offset] = cmd;
+			reg[i + offset] <<= PSP_CMDRESP_CMD_SHIFT;
+			reg[i + offset] |= PSP_CMDRESP_IOC;
+			iowrite32(reg[i + offset], psp->io_regs + psp->vdata->cmdresp_reg);
+
+			psp->sev_int_rcvd = 0;
+			offset += 1;
+
+			/* in case the vector size is smaller than psp device number */
+			if ((i + offset) >= count)
+				break;
+			psp = psp_get_next_device(psp);
+		}
+		step = offset;
+
+		/* wait for command vectors completion */
+		sev_wait_cmd_vec_ioc(&reg[i], step);
+
+		offset = 0;
+		psp = psp_get_next_device(NULL);
+		while (psp) {
+			if (psp_ret)
+				*psp_ret = reg[i + offset] & PSP_CMDRESP_ERR_MASK;
+
+			if (reg[i + offset] & PSP_CMDRESP_ERR_MASK) {
+				dev_dbg(psp->dev, "sev command %#x failed (%#010x)\n",
+						cmd, reg[i + offset] & PSP_CMDRESP_ERR_MASK);
+				ret = -EIO;
+				goto e_free;
+			}
+
+			print_hex_dump_debug("(out): ", DUMP_PREFIX_OFFSET, 16, 2,
+								 (uint8_t *)data + (i + offset) * cmd_len,
+								 cmd_len, false);
+			offset += 1;
+			/* in case the vector size is smaller than psp device number */
+			if ((i + offset) >= count)
+				break;
+			psp = psp_get_next_device(psp);
+		}
+		i += step;
+	}
+
+e_free:
+	kfree(reg);
+
+	return ret;
+}
+
 static int sev_do_cmd(int cmd, void *data, int *psp_ret)
 {
 	int rc;
 
 	mutex_lock(&sev_cmd_mutex);
 	rc = __sev_do_cmd_locked(cmd, data, psp_ret);
+	mutex_unlock(&sev_cmd_mutex);
+
+	return rc;
+}
+
+static int sev_do_cmd_vec(int cmd, void *data, int len, int *psp_ret)
+{
+	int rc;
+
+	mutex_lock(&sev_cmd_mutex);
+	rc = __sev_do_cmd_vec_locked(cmd, data, len, psp_ret);
 	mutex_unlock(&sev_cmd_mutex);
 
 	return rc;
@@ -232,7 +409,7 @@ static int __sev_platform_init_locked(int *error)
 		return rc;
 
 	psp->sev_state = SEV_STATE_INIT;
-	dev_dbg(psp->dev, "SEV firmware initialized\n");
+	dev_dbg(psp->dev, "CSV firmware initialized\n");
 
 	return rc;
 }
@@ -258,7 +435,7 @@ static int __sev_platform_shutdown_locked(int *error)
 		return ret;
 
 	psp_master->sev_state = SEV_STATE_UNINIT;
-	dev_dbg(psp_master->dev, "SEV firmware shutdown\n");
+	dev_dbg(psp_master->dev, "CSV firmware shutdown\n");
 
 	return ret;
 }
@@ -429,7 +606,7 @@ static int sev_get_api_version(void)
 	ret = sev_platform_status(status, &error);
 	if (ret) {
 		dev_err(psp_master->dev,
-			"SEV: failed to get status. Error: %#x\n", error);
+			"CSV: failed to get status, Error: %#x\n", error);
 		return 1;
 	}
 
@@ -440,7 +617,7 @@ static int sev_get_api_version(void)
 	return 0;
 }
 
-/* Don't fail if SEV FW couldn't be updated. Continue with existing SEV FW */
+/* Don't fail if CSV FW couldn't be updated. Continue with newer CSV FW */
 static int sev_update_firmware(struct device *dev)
 {
 	struct sev_data_download_firmware *data;
@@ -449,16 +626,16 @@ static int sev_update_firmware(struct device *dev)
 	struct page *p;
 	u64 data_size;
 
-	ret = request_firmware(&firmware, SEV_FW_FILE, dev);
+	ret = request_firmware(&firmware, CSV_FW_FILE, dev);
 	if (ret < 0)
 		return -1;
 
 	/*
-	 * SEV FW expects the physical address given to it to be 32
+	 * CSV FW expects the physical address given to it to be 32
 	 * byte aligned. Memory allocated has structure placed at the
-	 * beginning followed by the firmware being passed to the SEV
+	 * beginning followed by the firmware being passed to the CSV
 	 * FW. Allocate enough memory for data structure + alignment
-	 * padding + SEV FW.
+	 * padding + CSV FW.
 	 */
 	data_size = ALIGN(sizeof(struct sev_data_download_firmware), 32);
 
@@ -481,9 +658,9 @@ static int sev_update_firmware(struct device *dev)
 
 	ret = sev_do_cmd(SEV_CMD_DOWNLOAD_FIRMWARE, data, &error);
 	if (ret)
-		dev_dbg(dev, "Failed to update SEV firmware: %#x\n", error);
+		dev_dbg(dev, "Failed to update CSV firmware: %#x\n", error);
 	else
-		dev_info(dev, "SEV firmware update successful\n");
+		dev_info(dev, "CSV firmware update successful\n");
 
 	__free_pages(p, order);
 
@@ -547,40 +724,47 @@ e_free:
 
 static int sev_ioctl_do_get_id(struct sev_issue_cmd *argp)
 {
-	struct sev_data_get_id *data;
-	u64 data_size, user_size;
-	void *id_blob, *mem;
+	struct sev_user_get_id_cmd_buf input;
+	struct sev_get_id_cmd_buf *data;
+	void *id = NULL;
 	int ret;
 
-	/* SEV GET_ID available from SEV API v0.16 and up */
-	if (!SEV_VERSION_GREATER_OR_EQUAL(0, 16))
-		return -ENOTSUPP;
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
 
-	/* SEV FW expects the buffer it fills with the ID to be
-	 * 8-byte aligned. Memory allocated should be enough to
-	 * hold data structure + alignment padding + memory
-	 * where SEV FW writes the ID.
-	 */
-	data_size = ALIGN(sizeof(struct sev_data_get_id), 8);
-	user_size = sizeof(struct sev_user_data_get_id);
-
-	mem = kzalloc(data_size + user_size, GFP_KERNEL);
-	if (!mem)
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
 		return -ENOMEM;
 
-	data = mem;
-	id_blob = mem + data_size;
-
-	data->address = __psp_pa(id_blob);
-	data->len = user_size;
+	id = kzalloc(input.length, GFP_KERNEL);
+	if (IS_ERR(id)) {
+		ret = PTR_ERR(id);
+		goto e_free;
+	}
+	data->address = __psp_pa(id);
+	data->length = input.length;
 
 	ret = __sev_do_cmd_locked(SEV_CMD_GET_ID, data, &argp->error);
-	if (!ret) {
-		if (copy_to_user((void __user *)argp->data, id_blob, data->len))
+	input.length = data->length;
+
+	if (ret)
+		goto e_ret;
+
+	if (id) {
+		if (copy_to_user((void *)input.address, id, input.length)) {
 			ret = -EFAULT;
+			goto e_free_id;
+		}
 	}
 
-	kfree(mem);
+e_ret:
+	if (copy_to_user((void __user *)argp->data, &input, sizeof(*data)))
+		ret = -EFAULT;
+
+e_free_id:
+	kfree(id);
+e_free:
+	kfree(data);
 
 	return ret;
 }
@@ -679,6 +863,166 @@ e_free:
 	return ret;
 }
 
+void *psp_copy_user_csv_fw(u64 __user uaddr, u32 len)
+{
+	return memdup_user((void __user *)(uintptr_t)uaddr, len);
+}
+
+static int sev_ioctl_download_firmware(struct sev_issue_cmd *argp)
+{
+	struct sev_data_download_firmware *data = NULL;
+	struct sev_user_data_download_firmware input;
+	int ret, order;
+	struct page *p;
+	u64 data_size;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input))) {
+		argp->error = SEV_RET_INVALID_PARAM;	// INVALID_PARAM
+		ret = -EFAULT;
+		goto fail;
+	}
+
+	if (!input.address) {
+		argp->error = SEV_RET_INVALID_ADDRESS;
+		ret = -EINVAL;
+		goto fail;
+	}
+	if(!input.len || input.len > CSV_FW_MAX_SIZE) {
+		argp->error = SEV_RET_INVALID_LEN;
+		ret = -EINVAL;
+		goto fail;
+	}
+
+	/*
+	 * CSV FW expects the physical address given to it to be 32
+	 * byte aligned. Memory allocated has structure placed at the
+	 * beginning followed by the firmware being passed to the CSV
+	 * FW. Allocate enough memory for data structure + alignment
+	 * padding + CSV FW.
+	 */
+	data_size = ALIGN(sizeof(struct sev_data_download_firmware), 32);
+
+	order = get_order(input.len + data_size);
+	p = alloc_pages(GFP_KERNEL, order);
+	if (!p) {
+		argp->error = SEV_RET_INVALID_PARAM;	// INVALID_PARAM
+		ret = -ENOMEM;
+		goto fail;
+	}
+
+	/*
+	 * Copy firmware data to a kernel allocated contiguous
+	 * memory region.
+	 */
+	data = page_address(p);
+	if (copy_from_user((void *)((uint64_t)page_address(p) + data_size),
+			   (void *)(input.address), input.len)) {
+		argp->error = SEV_RET_INVALID_PARAM;	// INVALID_PARAM
+		ret = -EFAULT;
+		goto fail_free_page;
+	}
+
+	data->address = __psp_pa(page_address(p) + data_size);
+	data->len = input.len;
+
+	ret = __sev_do_cmd_locked(SEV_CMD_DOWNLOAD_FIRMWARE, data, &argp->error);
+	if (ret)
+		pr_err("Failed to update CSV firmware: %#x\n", argp->error);
+	else
+		pr_info("CSV firmware update successful\n");
+
+fail_free_page:
+	__free_pages(p, order);
+
+fail:
+	return ret;
+}
+
+static int sev_ioctl_do_gm_pubkey_gen(struct sev_issue_cmd *argp)
+{
+	struct sev_user_data_gm_pubkey_gen input;
+	void *key_id_blob = NULL, *pubkey_blob = NULL;
+	struct sev_data_gm_pubkey_gen *data;
+	int ret;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	/* Userspace wants to query the public key length. */
+	if (!input.pubkey_address ||
+	    !input.pubkey_len)
+		goto cmd;
+
+	/* Copy key id blob from userspace. */
+	key_id_blob = psp_copy_user_blob(input.key_id_address, input.key_id_len);
+	if (IS_ERR(key_id_blob)) {
+		ret = PTR_ERR(key_id_blob);
+		goto e_free;
+	}
+
+	data->key_id_address = __psp_pa(key_id_blob);
+	data->key_id_len = input.key_id_len;
+
+	/* Allocate a physically contiguous buffer to store the public key blob. */
+	if ((input.pubkey_len > SEV_FW_BLOB_MAX_SIZE) ||
+	    !access_ok(VERIFY_WRITE, input.pubkey_address, input.pubkey_len)) {
+		ret = -EFAULT;
+		goto e_free_key_id;
+	}
+
+	pubkey_blob = kmalloc(input.pubkey_len, GFP_KERNEL);
+	if (!pubkey_blob) {
+		ret = -ENOMEM;
+		goto e_free_key_id;
+	}
+
+	data->pubkey_address = __psp_pa(pubkey_blob);
+	data->pubkey_len = input.pubkey_len;
+
+cmd:
+#ifndef CONFIG_VAL_A0_TEST
+	/* If platform is not in INIT state then transition it to INIT. */
+	if (psp_master->sev_state != SEV_STATE_INIT) {
+		ret = __sev_platform_init_locked(&argp->error);
+		if (ret)
+			goto e_free_pubkey;
+	}
+#endif
+
+	ret = __sev_do_cmd_locked(SEV_CMD_GM_PUBKEY_GEN, data, &argp->error);
+
+	/* If we query the length, FW responded with expected data. */
+	input.pubkey_len = data->pubkey_len;
+
+	if (copy_to_user((void __user *)argp->data, &input, sizeof(input))) {
+		ret = -EFAULT;
+		goto e_free_pubkey;
+	}
+
+	if (ret)
+		goto e_free_pubkey;
+
+	if (pubkey_blob) {
+		if (copy_to_user((void __user *)input.pubkey_address,
+				 pubkey_blob, input.pubkey_len)) {
+			ret = -EFAULT;
+			goto e_free_pubkey;
+		}
+	}
+
+e_free_pubkey:
+	kfree(pubkey_blob);
+e_free_key_id:
+	kfree(key_id_blob);
+e_free:
+	kfree(data);
+	return ret;
+}
+
 static long sev_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 {
 	void __user *argp = (void __user *)arg;
@@ -725,6 +1069,21 @@ static long sev_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 	case SEV_GET_ID:
 		ret = sev_ioctl_do_get_id(&input);
 		break;
+	case SEV_GM_PUBKEY_GEN:
+		ret = sev_ioctl_do_gm_pubkey_gen(&input);
+		break;
+	case SEV_USER_CMD_INIT: {
+		ret = __sev_platform_init_locked(&input.error);
+		break;
+	}
+	case SEV_USER_CMD_SHUTDOWN: {
+		ret = __sev_platform_shutdown_locked(&input.error);
+		break;
+	}
+	case SEV_USER_CMD_DOWNLOAD_FIRMWARE: {
+		ret = sev_ioctl_download_firmware(&input);
+		break;
+	}
 	default:
 		ret = -EINVAL;
 		goto out;
@@ -815,7 +1174,8 @@ static int sev_misc_init(struct psp_device *psp)
 
 	init_waitqueue_head(&psp->sev_int_queue);
 	psp->sev_misc = misc_dev;
-	dev_dbg(dev, "registered SEV device\n");
+	psp->id = atomic_inc_return(&psp_id);
+	dev_dbg(dev, "registered SEV device id %d\n", psp->id);
 
 	return 0;
 }
@@ -843,6 +1203,8 @@ int psp_dev_init(struct sp_device *sp)
 		goto e_err;
 
 	sp->psp_data = psp;
+
+	psp_add_device(psp);
 
 	psp->vdata = (struct psp_vdata *)sp->dev_vdata->psp_vdata;
 	if (!psp->vdata) {
@@ -895,6 +1257,8 @@ void psp_dev_destroy(struct sp_device *sp)
 	if (!psp)
 		return;
 
+	psp_del_device(psp);
+
 	if (psp->sev_misc)
 		kref_put(&misc_dev->refcount, sev_exit);
 
@@ -910,6 +1274,16 @@ int sev_issue_cmd_external_user(struct file *filep, unsigned int cmd,
 	return  sev_do_cmd(cmd, data, error);
 }
 EXPORT_SYMBOL_GPL(sev_issue_cmd_external_user);
+
+int sev_issue_cmd_vec_external_user(struct file *filep, unsigned int cmd,
+				void *data, int len, int *error)
+{
+	if (!filep || filep->f_op != &sev_fops)
+		return -EBADF;
+
+	return  sev_do_cmd_vec(cmd, data, len, error);
+}
+EXPORT_SYMBOL_GPL(sev_issue_cmd_vec_external_user);
 
 void psp_pci_init(void)
 {
@@ -927,24 +1301,25 @@ void psp_pci_init(void)
 	if (sev_get_api_version())
 		goto err;
 
-	if (SEV_VERSION_GREATER_OR_EQUAL(0, 15) &&
+	if (SEV_VERSION_GREATER_OR_EQUAL(1, 1) &&
 	    sev_update_firmware(psp_master->dev) == 0)
 		sev_get_api_version();
 
 	/* Initialize the platform */
 	rc = sev_platform_init(&error);
 	if (rc) {
-		dev_err(sp->dev, "SEV: failed to INIT error %#x\n", error);
-		return;
+		dev_err(sp->dev, "CSV: failed to INIT error %#x\n", error);
+		goto err;
 	}
 
-	dev_info(sp->dev, "SEV API:%d.%d build:%d\n", psp_master->api_major,
+	dev_info(sp->dev, "CSV API:%d.%d build:%d\n", psp_master->api_major,
 		 psp_master->api_minor, psp_master->build);
 
 	return;
 
 err:
-	psp_master = NULL;
+    psp_master = NULL;
+    return ;
 }
 
 void psp_pci_exit(void)
@@ -954,3 +1329,126 @@ void psp_pci_exit(void)
 
 	sev_platform_shutdown(NULL);
 }
+
+int sev_platform_register_log_buf(void *log_buf, uint32_t log_buf_size)
+{
+    int ret = 0;
+    int error;
+    struct sev_log_buffer *data = NULL;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data) {
+        ret = -ENOMEM;
+		goto e_ret;
+    }
+    data->log_buffer_address = __sme_set(__pa(log_buf));
+    data->log_buffer_length = log_buf_size;
+
+    ret = sev_do_cmd(SEV_CMD_REGISTER_LOG, data, &error);
+	if (ret)
+		goto e_free;
+
+    if (error != SEV_RET_SUCCESS) {
+        pr_err("sev register log buffer fail \n");
+        goto e_free;
+    }
+
+e_free:
+	kfree(data);
+e_ret:
+	return ret;
+
+}
+EXPORT_SYMBOL_GPL(sev_platform_register_log_buf);
+
+void sev_platform_unregister_log_buf(void)
+{
+    int ret;
+    int error;
+
+    ret = sev_do_cmd(SEV_CMD_UNREGISTER_LOG, NULL, &error);
+	if (ret) {
+        pr_err("sev_issue_cmd SEV_CMD_UNREGISTER_LOG fail \n");
+    }
+
+    if (error != SEV_RET_SUCCESS) {
+        pr_err("sev unregister log buffer fail \n");
+    }
+    return;
+}
+EXPORT_SYMBOL_GPL(sev_platform_unregister_log_buf);
+
+int sev_platform_set_log_level(unsigned int log_level)
+{
+	int ret = 0;
+	int error;
+	struct sev_log_level *data = NULL;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data) {
+		ret = -ENOMEM;
+		goto e_ret;
+	}
+	data->log_level = log_level;
+
+	ret = sev_do_cmd(SEV_CMD_SET_LOG_LEVEL, data, &error);
+	if (ret)
+		goto e_free;
+
+	if (error != SEV_RET_SUCCESS) {
+		pr_err("sev set log level fail \n");
+		goto e_free;
+	}
+
+e_free:
+	kfree(data);
+e_ret:
+	return ret;
+
+}
+EXPORT_SYMBOL_GPL(sev_platform_set_log_level);
+
+int sev_platform_get_log_level(unsigned int *log_level)
+{
+	int ret = 0;
+	int error;
+	struct sev_log_level *data = NULL;
+
+	if (!log_level) {
+		ret = -EFAULT;
+		goto e_ret;
+	}
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data) {
+		ret = -ENOMEM;
+		goto e_ret;
+	}
+
+	ret = sev_do_cmd(SEV_CMD_GET_LOG_LEVEL, data, &error);
+	if (ret)
+		goto e_free;
+
+	if (error != SEV_RET_SUCCESS) {
+		pr_err("sev set log level fail \n");
+		goto e_free;
+	}
+
+	*log_level = data->log_level;
+
+e_free:
+	kfree(data);
+e_ret:
+	return ret;
+
+}
+EXPORT_SYMBOL_GPL(sev_platform_get_log_level);
+
+int sev_get_psp_dev_num(void)
+{
+	if (!psp_master)
+		return 0;
+
+	return atomic_read(&psp_id);
+}
+EXPORT_SYMBOL_GPL(sev_get_psp_dev_num);

@@ -4778,6 +4778,30 @@ set_identity_unlock:
 		r = kvm_vm_ioctl_hv_eventfd(kvm, &hvevfd);
 		break;
 	}
+	case KVM_GET_PAGE_ENC_BITMAP: {
+		struct kvm_page_enc_bitmap bitmap;
+
+		r = -EFAULT;
+		if (copy_from_user(&bitmap, argp, sizeof(bitmap)))
+			goto out;
+
+		r = -ENOTTY;
+		if (kvm_x86_ops->get_page_enc_bitmap)
+			r = kvm_x86_ops->get_page_enc_bitmap(kvm, &bitmap);
+		break;
+	}
+	case KVM_SET_PAGE_ENC_BITMAP: {
+		struct kvm_page_enc_bitmap bitmap;
+
+		r = -EFAULT;
+		if (copy_from_user(&bitmap, argp, sizeof(bitmap)))
+			goto out;
+
+		r = -ENOTTY;
+		if (kvm_x86_ops->set_page_enc_bitmap)
+			r = kvm_x86_ops->set_page_enc_bitmap(kvm, &bitmap);
+		break;
+	}
 	default:
 		r = -ENOTTY;
 	}
@@ -7026,6 +7050,11 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 #endif
 	case KVM_HC_SEND_IPI:
 		ret = kvm_pv_send_ipi(vcpu->kvm, a0, a1, a2, a3, op_64_bit);
+		break;
+	case KVM_HC_PAGE_ENC_STATUS:
+		ret = -KVM_ENOSYS;
+		if (kvm_x86_ops->page_enc_status_hc)
+			ret = kvm_x86_ops->page_enc_status_hc(vcpu->kvm, a0, a1, a2);
 		break;
 	default:
 		ret = -KVM_ENOSYS;

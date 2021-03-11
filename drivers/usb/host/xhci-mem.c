@@ -2364,6 +2364,7 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
 {
 	dma_addr_t	dma;
 	struct device	*dev = xhci_to_hcd(xhci)->self.sysdev;
+	struct pci_dev	*pdev = to_pci_dev(dev);
 	unsigned int	val, val2;
 	u64		val_64;
 	u32		page_size, temp;
@@ -2429,8 +2430,14 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
 	 * and our use of dma addresses in the trb_address_map radix tree needs
 	 * TRB_SEGMENT_SIZE alignment, so we pick the greater alignment need.
 	 */
-	xhci->segment_pool = dma_pool_create("xHCI ring segments", dev,
-			TRB_SEGMENT_SIZE, TRB_SEGMENT_SIZE, xhci->page_size);
+	/*With Zhaoxin xHCI TRB prefetch patch:To fix cross page boundry access issue in IOV environment*/
+	if ((pdev->vendor == PCI_VENDOR_ID_ZX) && (pdev->device == 0x9202 || pdev->device == 0x9203)) {
+		xhci->segment_pool = dma_pool_create("xHCI ring segments", dev,
+		    TRB_SEGMENT_SIZE*2, TRB_SEGMENT_SIZE*2, xhci->page_size*2);
+		printk("With Zhaoxin xHCI TRB prefetch patch V1.0.0\n");
+	} else
+		xhci->segment_pool = dma_pool_create("xHCI ring segments", dev,
+		    TRB_SEGMENT_SIZE, TRB_SEGMENT_SIZE, xhci->page_size);
 
 	/* See Table 46 and Note on Figure 55 */
 	xhci->device_pool = dma_pool_create("xHCI input/output contexts", dev,

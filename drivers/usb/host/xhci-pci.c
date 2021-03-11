@@ -235,6 +235,11 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
 
 	if (pdev->vendor == PCI_VENDOR_ID_TI && pdev->device == 0x8241)
 		xhci->quirks |= XHCI_LIMIT_ENDPOINT_INTERVAL_7;
+ 
+	if (pdev->vendor == PCI_VENDOR_ID_ZX && pdev->device == 0x9202) {
+		dev_info(&pdev->dev, "XHCI QUIRK: Resetting on resume patch V1.0.0\n");
+		xhci->quirks |= XHCI_RESET_ON_RESUME;
+	}
 
 	if ((pdev->vendor == PCI_VENDOR_ID_BROADCOM ||
 	     pdev->vendor == PCI_VENDOR_ID_CAVIUM) &&

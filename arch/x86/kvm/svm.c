@@ -138,6 +138,8 @@ struct kvm_sev_info {
 	int fd;			/* SEV device fd */
 	unsigned long pages_locked; /* Number of pages locked */
 	struct list_head regions_list;  /* List of registered regions */
+	unsigned long *page_enc_bmap;
+	unsigned long page_enc_bmap_size;
 };
 
 struct kvm_svm {
@@ -418,6 +420,7 @@ enum {
 
 static unsigned int max_sev_asid;
 static unsigned int min_sev_asid;
+static unsigned long sev_me_mask;
 static unsigned long *sev_asid_bitmap;
 #define __sme_page_pa(x) __sme_set(page_to_pfn(x) << PAGE_SHIFT)
 
@@ -456,6 +459,13 @@ static inline int sev_get_asid(struct kvm *kvm)
 	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
 
 	return sev->asid;
+}
+
+static inline int sev_get_handle(struct kvm *kvm)
+{
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+
+	return sev->handle;
 }
 
 static inline void mark_all_dirty(struct vmcb *vmcb)
@@ -1224,16 +1234,21 @@ static int avic_ga_log_notifier(u32 ga_tag)
 static __init int sev_hardware_setup(void)
 {
 	struct sev_user_data_status *status;
+	int eax, ebx;
 	int rc;
 
-	/* Maximum number of encrypted guests supported simultaneously */
-	max_sev_asid = cpuid_ecx(0x8000001F);
+	/*
+	 * Query the memory encryption information.
+	 *  EBX:  Bit 0:5 Pagetable bit position used to indicate encryption (aka Cbit).
+	 *  ECX:  Maximum number of encrypted guests supported simultaneously.
+	 *  EDX:  Minimum ASID value that should be used for SEV guest.
+	 */
+	cpuid(0x8000001f, &eax, &ebx, &max_sev_asid, &min_sev_asid);
 
 	if (!max_sev_asid)
 		return 1;
 
-	/* Minimum ASID value that should be used for SEV guest */
-	min_sev_asid = cpuid_edx(0x8000001F);
+	sev_me_mask = 1UL << (ebx & 0x3f);
 
 	/* Initialize SEV ASID bitmap */
 	sev_asid_bitmap = bitmap_zalloc(max_sev_asid, GFP_KERNEL);
@@ -1255,7 +1270,7 @@ static __init int sev_hardware_setup(void)
 	if (rc)
 		goto err;
 
-	pr_info("SEV supported\n");
+	pr_info("CSV supported\n");
 
 err:
 	kfree(status);
@@ -1908,6 +1923,8 @@ static void sev_vm_destroy(struct kvm *kvm)
 
 	sev_unbind_asid(kvm, sev->handle);
 	sev_asid_free(kvm);
+
+	kvfree(sev->page_enc_bmap);
 }
 
 static void avic_vm_destroy(struct kvm *kvm)
@@ -2082,6 +2099,7 @@ static void avic_set_running(struct kvm_vcpu *vcpu, bool is_run)
 
 static void svm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 {
+	struct kvm_sev_info *sev = &to_kvm_svm(vcpu->kvm)->sev_info;
 	struct vcpu_svm *svm = to_svm(vcpu);
 	u32 dummy;
 	u32 eax = 1;
@@ -6278,6 +6296,13 @@ static int sev_asid_new(void)
 	int pos;
 
 	/*
+	 * There may be a platform return min_sev_asid of 0 which cause
+	 * sev_guest_init() fail.
+	 */
+	if (min_sev_asid == 0)
+		min_sev_asid = 1;
+
+	/*
 	 * SEV-enabled guest must use asid from min_sev_asid to max_sev_asid.
 	 */
 	pos = find_next_zero_bit(sev_asid_bitmap, max_sev_asid, min_sev_asid - 1);
@@ -6363,6 +6388,28 @@ static int sev_issue_cmd(struct kvm *kvm, int id, void *data, int *error)
 	return __sev_issue_cmd(sev->fd, id, data, error);
 }
 
+static int __sev_issue_cmd_vec(int fd, int id, void *data, int len, int *error)
+{
+	struct fd f;
+	int ret;
+
+	f = fdget(fd);
+	if (!f.file)
+		return -EBADF;
+
+	ret = sev_issue_cmd_vec_external_user(f.file, id, data, len, error);
+
+	fdput(f);
+	return ret;
+}
+
+static int sev_issue_cmd_vec(struct kvm *kvm, int id, void *data, int len, int *error)
+{
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+
+	return __sev_issue_cmd_vec(sev->fd, id, data, len, error);
+}
+
 static int sev_launch_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
 {
 	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
@@ -6391,7 +6438,7 @@ static int sev_launch_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
 		}
 
 		start->dh_cert_address = __sme_set(__pa(dh_blob));
-		start->dh_cert_len = params.dh_len;
+		start->dh_cert_length = params.dh_len;
 	}
 
 	session_blob = NULL;
@@ -6402,8 +6449,8 @@ static int sev_launch_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
 			goto e_free_dh;
 		}
 
-		start->session_address = __sme_set(__pa(session_blob));
-		start->session_len = params.session_len;
+		start->session_data_address = __sme_set(__pa(session_blob));
+		start->session_data_length = params.session_len;
 	}
 
 	start->handle = params.handle;
@@ -6513,7 +6560,7 @@ static int sev_launch_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
 		len = min_t(size_t, ((pages * PAGE_SIZE) - offset), size);
 
 		data->handle = sev->handle;
-		data->len = len;
+		data->length = len;
 		data->address = __sme_page_pa(inpages[i]) + offset;
 		ret = sev_issue_cmd(kvm, SEV_CMD_LAUNCH_UPDATE_DATA, data, &argp->error);
 		if (ret)
@@ -6573,7 +6620,7 @@ static int sev_launch_measure(struct kvm *kvm, struct kvm_sev_cmd *argp)
 			goto e_free;
 
 		data->address = __psp_pa(blob);
-		data->len = params.len;
+		data->length = params.len;
 	}
 
 cmd:
@@ -6595,7 +6642,7 @@ cmd:
 	}
 
 done:
-	params.len = data->len;
+	params.len = data->length;
 	if (copy_to_user(measure, &params, sizeof(params)))
 		ret = -EFAULT;
 e_free_blob:
@@ -6670,7 +6717,7 @@ static int __sev_issue_dbg_cmd(struct kvm *kvm, unsigned long src,
 	data->handle = sev->handle;
 	data->dst_addr = dst;
 	data->src_addr = src;
-	data->len = size;
+	data->length = size;
 
 	ret = sev_issue_cmd(kvm,
 			    enc ? SEV_CMD_DBG_ENCRYPT : SEV_CMD_DBG_DECRYPT,
@@ -6930,7 +6977,7 @@ static int sev_launch_secret(struct kvm *kvm, struct kvm_sev_cmd *argp)
 
 	offset = params.guest_uaddr & (PAGE_SIZE - 1);
 	data->guest_address = __sme_page_pa(pages[0]) + offset;
-	data->guest_len = params.guest_len;
+	data->guest_length = params.guest_len;
 
 	blob = psp_copy_user_blob(params.trans_uaddr, params.trans_len);
 	if (IS_ERR(blob)) {
@@ -6939,7 +6986,7 @@ static int sev_launch_secret(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	}
 
 	data->trans_address = __psp_pa(blob);
-	data->trans_len = params.trans_len;
+	data->trans_length = params.trans_len;
 
 	hdr = psp_copy_user_blob(params.hdr_uaddr, params.hdr_len);
 	if (IS_ERR(hdr)) {
@@ -6947,7 +6994,7 @@ static int sev_launch_secret(struct kvm *kvm, struct kvm_sev_cmd *argp)
 		goto e_free_blob;
 	}
 	data->hdr_address = __psp_pa(hdr);
-	data->hdr_len = params.hdr_len;
+	data->hdr_length = params.hdr_len;
 
 	data->handle = sev->handle;
 	ret = sev_issue_cmd(kvm, SEV_CMD_LAUNCH_UPDATE_SECRET, data, &argp->error);
@@ -6961,6 +7008,1248 @@ e_free:
 e_unpin_memory:
 	sev_unpin_memory(kvm, pages, n);
 	return ret;
+}
+
+static int sev_send_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
+{
+	struct sev_data_send_start *start = NULL;
+	struct kvm_sev_send_start params;
+	void *pdh_cert_addr = NULL;
+	void *plat_cert_addr = NULL;
+	void *vendor_cert_addr = NULL;
+	void *session_data = NULL;
+	int ret;
+	struct fd f;
+
+	if (!sev_guest(kvm))
+		return -ENOTTY;
+
+	f = fdget(argp->sev_fd);
+	if (!f.file)
+		return -EBADF;
+
+	ret = -EFAULT;
+	if (copy_from_user(&params, (void *)argp->data,
+				sizeof(struct kvm_sev_send_start)))
+		goto e_free;
+
+	ret = -ENOMEM;
+	start = kzalloc(sizeof(*start), GFP_KERNEL);
+	if (!start)
+		goto e_free;
+
+	start->handle = sev_get_handle(kvm);
+
+	if (params.pdh_cert_length && params.pdh_cert_data) {
+		ret = -ENOMEM;
+		pdh_cert_addr = kmalloc(params.pdh_cert_length, GFP_KERNEL);
+		if (!pdh_cert_addr)
+			goto e_free;
+
+		ret = -EFAULT;
+		if (copy_from_user(pdh_cert_addr, (void *)params.pdh_cert_data,
+				params.pdh_cert_length))
+			goto e_free;
+
+		start->pdh_cert_address = __sme_set(__pa(pdh_cert_addr));
+		start->pdh_cert_length = params.pdh_cert_length;
+	}
+	if (params.plat_cert_length && params.plat_cert_data) {
+		ret = -ENOMEM;
+		plat_cert_addr = kmalloc(params.plat_cert_length, GFP_KERNEL);
+		if (!plat_cert_addr)
+			goto e_free;
+
+		ret = -EFAULT;
+		if (copy_from_user(plat_cert_addr, (void *)params.plat_cert_data,
+				params.plat_cert_length))
+			goto e_free;
+
+		start->plat_cert_address = __sme_set(__pa(plat_cert_addr));
+		start->plat_cert_length = params.plat_cert_length;
+	}
+	if (params.vendor_cert_length && params.vendor_cert_data) {
+		ret = -ENOMEM;
+		vendor_cert_addr = kmalloc(params.vendor_cert_length, GFP_KERNEL);
+		if (!vendor_cert_addr)
+			goto e_free;
+
+		ret = -EFAULT;
+		if (copy_from_user(vendor_cert_addr, (void *)params.vendor_cert_data,
+				params.vendor_cert_length))
+			goto e_free;
+
+		start->vendor_cert_address = __sme_set(__pa(vendor_cert_addr));
+		start->vendor_cert_length = params.vendor_cert_length;
+	}
+	if (params.session_length && params.session_data) {
+		ret = -ENOMEM;
+		session_data = kmalloc(params.session_length, GFP_KERNEL);
+		if (!session_data)
+			goto e_free;
+
+		ret = -EFAULT;
+		if (copy_from_user(session_data, (void *)params.session_data,
+				params.session_length))
+			goto e_free;
+
+		start->session_address = __sme_set(__pa(session_data));
+		start->session_length = params.session_length;
+	}
+
+	ret = sev_issue_cmd_external_user(f.file, SEV_CMD_SEND_START,
+					  start, &argp->error);
+	params.session_length = start->session_length;
+	if (ret)
+		goto e_copy;
+
+	params.policy = start->policy;
+
+	if ( session_data && copy_to_user((void *) params.session_data,
+								session_data, params.session_length)) {
+		ret = -EFAULT;
+		goto e_copy;
+	}
+
+e_copy:
+	if (copy_to_user((void *) argp->data, &params,
+				sizeof(struct kvm_sev_send_start))) {
+		ret = -EFAULT;
+	}
+
+e_free:
+	kfree(pdh_cert_addr);
+	kfree(plat_cert_addr);
+	kfree(vendor_cert_addr);
+	kfree(session_data);
+	kfree(start);
+	fdput(f);
+	return ret;
+}
+
+#define SEV_HDR_FLAG_MULTI_DATA_MASK  0x10
+#define SEV_HDR_FLAG_MULTI_PSP_MASK   0x20
+#define SEV_HDR_IV_LEN                16
+#define SEV_HDR_MAC_LEN               32
+#define MULTI_DATA_INFO_ITEM_SIZE     (sizeof(struct sev_data_multi_data_info_item))
+
+struct sev_pinned_pages_item {
+	struct page **pages;
+	unsigned long n;
+};
+
+struct sev_pinned_pages {
+	struct sev_pinned_pages_item *item;
+	unsigned long num;
+};
+
+static inline int __sev_get_multi_data_info(struct kvm *kvm,
+				    struct sev_data_multi_data_info_item *info_data,
+				    unsigned long count, struct sev_pinned_pages *pinned_pages)
+{
+	int ret, i = 0;
+	struct kvm_sev_multi_data_info_item *info_item = NULL;
+	unsigned long n, offset;
+	struct page **pages = NULL;
+
+	/* traverse all multiple data info items */
+	for (i = 0; i < count; i++) {
+		info_item = (struct kvm_sev_multi_data_info_item *)&info_data[i];
+
+		ret = -EINVAL;
+		if (!info_item->guest_hva || !info_item->guest_len)
+			goto out;
+
+		/* d. handle with the guest data memory */
+		/*  Check if we are crossing the page boundry */
+		offset = info_item->guest_hva & (PAGE_SIZE - 1);
+		if ((info_item->guest_len + offset) > PAGE_SIZE)
+			goto out;
+
+		/* pin the guest memory region */
+		pages = sev_pin_memory(kvm, info_item->guest_hva & PAGE_MASK,
+							   info_item->guest_len, &n, 0);
+		if (!pages) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		/* update guest_hpa in multiple data info */
+		pinned_pages->item[i].pages = pages;
+		pinned_pages->item[i].n = n;
+		pinned_pages->num++;
+		info_data[i].guest_hpa = __sme_page_pa(pinned_pages->item[i].pages[0]) + offset;
+
+		/*
+		 * invalidate the cache to ensure that DRAM has recent content before calling
+		 * the SEV commands.
+		 */
+		sev_clflush_pages(pages, n);
+
+	}
+	ret = 0;
+
+out:
+	return ret;
+}
+
+/*
+ * __sev_send_update_data_new_cmd_vec - new a SEND_UPDATE_DATA command vector for multiple
+ *                                      sev devices
+ *
+ * @data: command data which contains the command params
+ * @hdr: headr of command data
+ * @info: multiple guest data info buffer
+ * @data_array: command data array to which we new a command vector
+ * @hdr_array: hdr_array to which we new the headrs for the commands of the command vector
+ * returns 0 on success, < 0 on failure
+ *
+ * Steps 1-3 below provide general overview of new a command vector.
+ * 1. divide multiple guest data info in info according to the number of
+ *    sev device
+ * 2. fill hdr data in hdr_array for each sev device
+ * 3. divide transfer buffer and fill command params in data_array for
+ *    each sev device
+ */
+static int __sev_send_update_data_new_cmd_vec(struct sev_data_send_update_data *data,
+					      struct sev_data_update_data_hdr *hdr,
+					      struct sev_data_multi_data_info_item *info,
+					      struct sev_data_send_update_data *data_array,
+					      struct sev_data_update_data_hdr *hdr_array)
+{
+	uint32_t i, j;
+	uint32_t info_item_num;
+	uint32_t info_idx_offset = 0;
+	uint32_t trans_offset = 0;
+	int32_t trans_length;
+	uint32_t guest_length;
+	uint32_t info_item_total;
+	struct sev_data_multi_data_info_item *info_item = NULL;
+	uint32_t cmd_item_num;
+
+	if (!data || !hdr || !info || !data_array ||
+	    !hdr_array)
+		return -EINVAL;
+
+	/* get the expected item number of command vector */
+	cmd_item_num = hdr->item_num;
+
+	if (!hdr->iv_array_addr || !hdr->mac_array_addr ||
+	    !hdr->iv_array_len || !hdr->mac_array_len ||
+	    hdr->iv_array_len < cmd_item_num * SEV_HDR_IV_LEN ||
+	    hdr->mac_array_len < cmd_item_num * SEV_HDR_MAC_LEN)
+		return -EINVAL;
+
+	if (data->guest_length > data->trans_length)
+		return -EINVAL;
+	trans_length = data->trans_length;
+
+	info_item_total = hdr->info_len / MULTI_DATA_INFO_ITEM_SIZE;
+
+	/* split cmd for multiple sev devices */
+	for (i = 0; i < cmd_item_num; i++) {
+		info_item_num = DIV_ROUND_UP(info_item_total, (cmd_item_num - i));
+
+		/* iterate the info items to get guest_length */
+		info_item = &info[info_idx_offset];
+		for (j = 0, guest_length = 0; j < info_item_num; j++)
+			guest_length += info_item[j].guest_len;
+
+		/* setup hdr for each sev device */
+		hdr_array[i].flags = hdr->flags;
+		hdr_array[i].info_len = info_item_num * MULTI_DATA_INFO_ITEM_SIZE;
+		hdr_array[i].info = __sme_set(__pa(info_item));
+		info_idx_offset += info_item_num;
+
+		/* copy the contents of data and update them below */
+		memcpy(&data_array[i], data, sizeof(*data));
+
+		/* setup the rest */
+		data_array[i].hdr_address = __sme_set(__pa(&hdr_array[i]));
+		data_array[i].trans_address += trans_offset;
+		data_array[i].trans_length = guest_length;
+		data_array[i].guest_address = info_item[0].guest_hpa;
+		data_array[i].guest_length = guest_length;
+
+		info_item_total -= info_item_num;
+		trans_offset += guest_length;
+		trans_length -= guest_length;
+	}
+	if (trans_length < 0)
+		return -EINVAL;
+
+	return 0;
+}
+
+/*
+ * __sev_send_update_data_copy_iv_mac - copy the ivs and macs from hdr array to userspace
+ *
+ * @hdr_array: hdr_array from which we copy the ivs and macs
+ * @hdr: iv array address and mac array address to which we copy the ivs and macs
+ * returns 0 on success, < 0 on failure
+ */
+static inline int __sev_send_update_data_copy_iv_mac(struct sev_data_update_data_hdr *hdr_array,
+						     struct sev_data_update_data_hdr *hdr)
+{
+	int i;
+
+	for (i = 0; i < hdr->item_num; i++) {
+		if (copy_to_user((void *) (hdr->iv_array_addr + i * SEV_HDR_IV_LEN),
+				 hdr_array[i].iv, SEV_HDR_IV_LEN)) {
+			return -EFAULT;
+		}
+		if (copy_to_user((void *) (hdr->mac_array_addr + i * SEV_HDR_MAC_LEN),
+				 hdr_array[i].mac, SEV_HDR_MAC_LEN)) {
+			return -EFAULT;
+		}
+	}
+	return 0;
+}
+
+static int sev_send_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
+{
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+	struct sev_data_send_update_data *data = NULL;
+	struct kvm_sev_send_update_data params;
+	struct page **pages = NULL;
+	void *trans = NULL, *hdr = NULL;
+	unsigned long n = 0, offset;
+	int ret, i = 0;
+	struct sev_data_multi_data_info_item *info_data = NULL;
+	struct sev_data_update_data_hdr *hdr_data = NULL;
+	void *info = NULL;
+	unsigned long info_vaddr;
+	struct sev_pinned_pages pinned_pages = {NULL, 0};
+	unsigned long count = 0;
+	struct sev_data_send_update_data *data_array = NULL;
+	struct sev_data_update_data_hdr *hdr_array = NULL;
+
+	if (!sev_guest(kvm))
+		return -ENOTTY;
+
+	if (copy_from_user(&params, (void __user *)(uintptr_t)argp->data,
+		sizeof(struct kvm_sev_send_update_data)))
+		return -EFAULT;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	/* a. get handle from kvm info*/
+	data->handle = sev->handle;
+
+	/* userspace wants to query header length */
+	if (!params.hdr_length)
+		goto cmd;
+
+	ret = -EINVAL;
+	if (!params.trans_address || !params.trans_length ||
+		!params.guest_address || !params.guest_length ||
+		!params.hdr_data)
+		goto e_free;
+
+	/* b. kmalloc a kernel buffer for hdr */
+	ret = -ENOMEM;
+	hdr = kzalloc(params.hdr_length, GFP_KERNEL);
+	if (!hdr)
+		goto e_free;
+
+	ret = -EFAULT;
+	if (copy_from_user(hdr, (void *)params.hdr_data,
+			params.hdr_length))
+		goto e_free;
+
+	data->hdr_address = __sme_set(__pa(hdr));
+	data->hdr_length = params.hdr_length;
+
+	/* c. kmalloc a kernel buffer for trans */
+	ret = -ENOMEM;
+	trans = kzalloc(params.trans_length, GFP_KERNEL);
+	if (!trans)
+		goto e_free;
+
+	data->trans_address = __sme_set(__pa(trans));
+	data->trans_length = params.trans_length;
+
+	hdr_data = (struct sev_data_update_data_hdr *)hdr;
+	/* check multi data flag */
+	if (hdr_data->flags & SEV_HDR_FLAG_MULTI_DATA_MASK) {
+		/* kzalloc a kernel buffer for multi_data_buffer */
+		if (!hdr_data->info_len || !hdr_data->info)
+			goto e_free;
+
+		ret = -ENOMEM;
+		info = kzalloc(hdr_data->info_len, GFP_KERNEL);
+		if (!info)
+			goto e_free;
+
+		/* save info vaddr */
+		info_vaddr = hdr_data->info;
+
+		ret = -EFAULT;
+		/* copy multiple data info from user */
+		if (copy_from_user(info, (void *)info_vaddr,
+						   hdr_data->info_len))
+			goto e_free;
+
+		info_data = (struct sev_data_multi_data_info_item *)info;
+		count = hdr_data->info_len / sizeof(struct sev_data_multi_data_info_item);
+
+		ret = -ENOMEM;
+		pinned_pages.item = kzalloc(count * sizeof(struct sev_pinned_pages_item), GFP_KERNEL);
+		if (!pinned_pages.item)
+			goto e_free;
+
+		ret = __sev_get_multi_data_info(kvm, info_data, count, &pinned_pages);
+		if (ret)
+			goto e_unpin;
+
+		hdr_data->info = __sme_set(__pa(info));
+
+		/* Guest_address is not used if the multi_data flag is set,
+		 * but still set here for FW checking */
+		data->guest_address = info_data[0].guest_hpa;
+		data->guest_length  = params.guest_length;
+
+		/* check the flag for multiple sev devices */
+		if (hdr_data->flags & SEV_HDR_FLAG_MULTI_PSP_MASK) {
+			uint32_t item_num;
+			uint32_t data_array_len;
+
+			ret = -EINVAL;
+			if (!hdr_data->item_num || count < hdr_data->item_num)
+				goto e_unpin;
+			item_num = hdr_data->item_num;
+
+			ret = -ENOMEM;
+			data_array_len = sizeof(struct sev_data_send_update_data) * item_num;
+			data_array = kzalloc(data_array_len, GFP_KERNEL);
+			if (!data_array)
+				goto e_unpin;
+
+			hdr_array = kzalloc(sizeof(struct sev_data_update_data_hdr) * item_num,
+					    GFP_KERNEL);
+			if (!hdr_array)
+				goto e_unpin;
+
+			/* split a command to a command vector for multiple sev devices */
+			ret = __sev_send_update_data_new_cmd_vec(data, hdr_data, info,
+								 data_array, hdr_array);
+			if (ret)
+				goto e_unpin;
+
+			/* e. send sev cmd vector to sev firmware */
+			ret = sev_issue_cmd_vec(kvm, SEV_CMD_SEND_UPDATE_DATA, data_array,
+						data_array_len, &argp->error);
+
+			/* get the final length of trans */
+			data->trans_length = 0;
+			for (i = 0; i < item_num; i++)
+				data->trans_length += data_array[i].trans_length;
+		} else {
+			/* e. send sev cmd to sev firmware */
+			ret = sev_issue_cmd(kvm, SEV_CMD_SEND_UPDATE_DATA, data, &argp->error);
+		}
+
+		/* restore info vaddr */
+		hdr_data->info = info_vaddr;
+	} else {
+		/*  Check if we are crossing the page boundry */
+		ret = -EINVAL;
+		offset = params.guest_address & (PAGE_SIZE - 1);
+		if ((params.guest_length + offset) > PAGE_SIZE)
+			goto e_free;
+
+		/* d. handle with the guest data memory */
+		/* pin the guest memory region */
+		pages = sev_pin_memory(kvm, params.guest_address & PAGE_MASK,
+							   params.guest_length, &n, 0);
+		if (!pages) {
+			ret = -ENOMEM;
+			goto e_free;
+		}
+
+		data->guest_address = __sme_page_pa(pages[0]) + offset;
+		data->guest_length = params.guest_length;
+
+		/*  flush the caches to ensure that DRAM has recent contents */
+		sev_clflush_pages(pages, n);
+
+cmd:
+		/* e. send sev cmd to sev firmware */
+		ret = sev_issue_cmd(kvm, SEV_CMD_SEND_UPDATE_DATA, data, &argp->error);
+	}
+
+	params.hdr_length = data->hdr_length;
+	if (ret)
+		goto e_copy;
+
+	params.trans_length = data->trans_length;
+
+	if (hdr ) {
+		if (copy_to_user((void *) params.hdr_data,
+				 hdr, params.hdr_length)) {
+			ret = -EFAULT;
+			goto e_copy;
+		}
+		/*
+		 * store iv and mac of each sev device into iv_array_addr and
+		 * mac_array_addr of hdr
+		 */
+		if (hdr_data->flags & SEV_HDR_FLAG_MULTI_PSP_MASK) {
+			if (__sev_send_update_data_copy_iv_mac(hdr_array,
+							       hdr_data)) {
+				ret = -EFAULT;
+				goto e_copy;
+			}
+		}
+	}
+
+	if ( trans && copy_to_user((void *) params.trans_address,
+								trans, params.trans_length)) {
+		ret = -EFAULT;
+		goto e_copy;
+	}
+
+e_copy:
+	if (copy_to_user((void *) argp->data, &params,
+				sizeof(struct kvm_sev_send_update_data))) {
+		ret = -EFAULT;
+	}
+
+e_unpin:
+	if (pinned_pages.num) {
+		for (i = 0; i < count; i++)
+			sev_unpin_memory(kvm, pinned_pages.item[i].pages, pinned_pages.item[i].n);
+	} else {
+		sev_unpin_memory(kvm, pages, n);
+	}
+
+e_free:
+	kfree(pinned_pages.item);
+	kfree(info);
+	kfree(hdr);
+	kfree(trans);
+	kfree(data);
+	kfree(hdr_array);
+	kfree(data_array);
+
+	return ret;
+}
+
+static int sev_send_finish(struct kvm *kvm, struct kvm_sev_cmd *argp)
+{
+	struct sev_data_send_finish *data = NULL;
+	int ret;
+
+	if (!sev_guest(kvm))
+		return -EINVAL;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	data->handle = sev_get_handle(kvm);
+	ret = sev_issue_cmd(kvm, SEV_CMD_SEND_FINISH, data, &argp->error);
+	if (ret)
+		goto e_free;
+
+e_free:
+	kfree(data);
+	return ret;
+}
+
+static int sev_receive_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
+{
+    struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+	struct sev_data_receive_start *start;
+	struct kvm_sev_receive_start params;
+	void *dh_blob, *session_blob;
+	int *error = &argp->error;
+	int ret;
+
+	if (!sev_guest(kvm))
+		return -ENOTTY;
+
+	if (copy_from_user(&params, (void __user *)(uintptr_t)argp->data, sizeof(params)))
+		return -EFAULT;
+
+	start = kzalloc(sizeof(*start), GFP_KERNEL);
+	if (!start)
+		return -ENOMEM;
+
+	dh_blob = NULL;
+	if (params.dh_uaddr) {
+		dh_blob = psp_copy_user_blob(params.dh_uaddr, params.dh_len);
+		if (IS_ERR(dh_blob)) {
+			ret = PTR_ERR(dh_blob);
+			goto e_free;
+		}
+
+		start->pdh_cert_address = __sme_set(__pa(dh_blob));
+		start->pdh_cert_length = params.dh_len;
+	}
+
+	session_blob = NULL;
+	if (params.session_uaddr) {
+		session_blob = psp_copy_user_blob(params.session_uaddr, params.session_len);
+		if (IS_ERR(session_blob)) {
+			ret = PTR_ERR(session_blob);
+			goto e_free_dh;
+		}
+
+		start->session_data_address = __sme_set(__pa(session_blob));
+		start->session_data_length = params.session_len;
+	}
+
+	start->handle = params.handle;
+	start->policy = params.policy;
+
+	/* create memory encryption context */
+	ret = __sev_issue_cmd(argp->sev_fd, SEV_CMD_RECEIVE_START, start, error);
+	if (ret)
+		goto e_copy;
+
+	/* Bind ASID to this guest */
+	ret = sev_bind_asid(kvm, start->handle, error);
+	if (ret)
+		goto e_copy;
+
+	/* return handle to userspace */
+	params.handle = start->handle;
+
+e_copy:
+	if (copy_to_user((void __user *)(uintptr_t)argp->data, &params, sizeof(params))) {
+		sev_unbind_asid(kvm, start->handle);
+		ret = -EFAULT;
+		goto e_free_session;
+	}
+
+	sev->handle = start->handle;
+	sev->fd = argp->sev_fd;
+
+e_free_session:
+	kfree(session_blob);
+e_free_dh:
+	kfree(dh_blob);
+e_free:
+	kfree(start);
+	return ret;
+}
+
+/*
+ * __sev_receive_update_data_new_cmd_vec - new a RECEIVE_UPDATE_DATA command vector for
+ *                                         multiple sev devices
+ *
+ * @data: command data which contains the command params
+ * @hdr: headr of command data
+ * @info: multiple guest data info buffer
+ * @data_array: command data array to which we new a command vector
+ * @hdr_array: hdr_array to which we new the headrs for the commands of the command vector
+ * returns 0 on success, < 0 on failure
+ *
+ * Steps 1-3 below provide general overview of new a command vector.
+ * 1. divide multiple guest data info in info according to the number of
+ *    sev device
+ * 2. get iv and mac from iv_array_addr and mac_array_addr of hdr,
+ *    fill hdr data in hdr_array for each sev device
+ * 3. divide transfer buffer and fill command params in data_array for
+ *    each sev device
+ */
+static int __sev_receive_update_data_new_cmd_vec(struct sev_data_receive_update_data *data,
+						 struct sev_data_update_data_hdr *hdr,
+						 struct sev_data_multi_data_info_item *info,
+						 struct sev_data_receive_update_data *data_array,
+						 struct sev_data_update_data_hdr *hdr_array)
+{
+	int ret;
+	uint32_t i, j;
+	uint32_t info_item_num;
+	uint32_t info_idx_offset = 0;
+	uint32_t trans_offset = 0;
+	int32_t trans_length;
+	uint32_t guest_length;
+	uint32_t info_item_total;
+	struct sev_data_multi_data_info_item *info_item = NULL;
+	uint8_t *iv_array = NULL;
+	uint8_t *mac_array = NULL;
+	uint32_t cmd_item_num;
+
+	ret = -EINVAL;
+	if (!data || !hdr || !info || !data_array ||
+	    !hdr_array)
+		goto out;
+
+	/* get the expected item number of command vector */
+	cmd_item_num = hdr->item_num;
+
+	if (!hdr->iv_array_addr || !hdr->mac_array_addr ||
+	    !hdr->iv_array_len || !hdr->mac_array_len ||
+	    hdr->iv_array_len < cmd_item_num * SEV_HDR_IV_LEN ||
+	    hdr->mac_array_len < cmd_item_num * SEV_HDR_MAC_LEN)
+		goto out;
+
+	if (data->guest_length < data->trans_length)
+		goto out;
+	trans_length = data->trans_length;
+
+	ret = -ENOMEM;
+	iv_array = kzalloc(hdr->iv_array_len, GFP_KERNEL);
+	if (!iv_array)
+		goto out;
+
+	mac_array = kzalloc(hdr->mac_array_len, GFP_KERNEL);
+	if (!mac_array)
+		goto e_free_iv_array;
+
+	ret = -EFAULT;
+	if (copy_from_user(iv_array, (void *)hdr->iv_array_addr,
+			   hdr->iv_array_len))
+		goto e_free_mac_array;
+	if (copy_from_user(mac_array, (void *)hdr->mac_array_addr,
+			   hdr->mac_array_len))
+		goto e_free_mac_array;
+
+	info_item_total = hdr->info_len / MULTI_DATA_INFO_ITEM_SIZE;
+
+	/* split cmd for multiple sev devices */
+	for (i = 0; i < cmd_item_num; i++) {
+		info_item_num = DIV_ROUND_UP(info_item_total, (cmd_item_num - i));
+
+		/* iterate the info items to get guest_length */
+		info_item = &info[info_idx_offset];
+		for (j = 0, guest_length = 0; j < info_item_num; j++)
+			guest_length += info_item[j].guest_len;
+
+		/* setup hdr for each sev device */
+		hdr_array[i].flags = hdr->flags;
+		hdr_array[i].info_len = info_item_num * MULTI_DATA_INFO_ITEM_SIZE;
+		hdr_array[i].info = __sme_set(__pa(info_item));
+
+		memcpy(hdr_array[i].iv, iv_array + i * SEV_HDR_IV_LEN, SEV_HDR_IV_LEN);
+		memcpy(hdr_array[i].mac, mac_array + i * SEV_HDR_MAC_LEN, SEV_HDR_MAC_LEN);
+
+		info_idx_offset += info_item_num;
+
+		/* copy the contents of data and update them below */
+		memcpy(&data_array[i], data, sizeof(*data));
+
+		/* setup the rest */
+		data_array[i].hdr_address = __sme_set(__pa(&hdr_array[i]));
+		data_array[i].trans_address += trans_offset;
+		data_array[i].trans_length = guest_length;
+		data_array[i].guest_address = info_item[0].guest_hpa;
+		data_array[i].guest_length = guest_length;
+
+		info_item_total -= info_item_num;
+		trans_offset += guest_length;
+		trans_length -= guest_length;
+	}
+
+	if (trans_length < 0) {
+		ret = -EINVAL;
+		goto e_free_mac_array;
+	}
+
+	ret = 0;
+
+e_free_mac_array:
+	kfree(mac_array);
+e_free_iv_array:
+	kfree(iv_array);
+out:
+	return ret;
+}
+
+static int sev_receive_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
+{
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+	struct sev_data_receive_update_data *data = NULL;
+	struct kvm_sev_receive_update_data params;
+	struct page **pages = NULL;
+	void *trans = NULL, *hdr = NULL;
+	unsigned long n = 0, offset;
+	int ret, i = 0;
+	struct sev_data_multi_data_info_item *info_data = NULL;
+	struct sev_data_update_data_hdr *hdr_data = NULL;
+	void *info = NULL;
+	unsigned long info_vaddr;
+	struct sev_pinned_pages pinned_pages = {NULL, 0};
+	unsigned long count = 0;
+	struct sev_data_receive_update_data *data_array = NULL;
+	struct sev_data_update_data_hdr *hdr_array = NULL;
+
+	if (!sev_guest(kvm))
+		return -ENOTTY;
+
+	if (copy_from_user(&params, (void __user *)(uintptr_t)argp->data,
+		sizeof(struct kvm_sev_receive_update_data)))
+		return -EFAULT;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	/* a. get handle from kvm info*/
+	data->handle = sev->handle;
+
+	ret = -EINVAL;
+	if (!params.hdr_data || !params.hdr_length ||
+		!params.trans_address || !params.trans_length ||
+		!params.guest_address || !params.guest_length)
+		goto e_free;
+
+	/* b. copy the packet header from userspace into a kernel buffer */
+	ret = -ENOMEM;
+	hdr = kzalloc(params.hdr_length, GFP_KERNEL);
+	if (!hdr)
+		goto e_free;
+
+	ret = -EFAULT;
+	if (copy_from_user(hdr, (void *)params.hdr_data,
+					   params.hdr_length))
+		goto e_free;
+
+	data->hdr_address = __sme_set(__pa(hdr));
+	data->hdr_length = params.hdr_length;
+
+	/* c. copy the secret trans data from userspace into a kernel buffer */
+	ret = -ENOMEM;
+	trans = kzalloc(params.trans_length, GFP_KERNEL);
+	if (!trans)
+		goto e_free;
+
+	ret = -EFAULT;
+	if (copy_from_user(trans, (void *)params.trans_address,
+					   params.trans_length))
+		goto e_free;
+
+	data->trans_address = __sme_set(__pa(trans));
+	data->trans_length = params.trans_length;
+
+	hdr_data = (struct sev_data_update_data_hdr *)hdr;
+	/* check multi data flag */
+	if (hdr_data->flags & SEV_HDR_FLAG_MULTI_DATA_MASK) {
+		/* kzalloc a kernel buffer for multi_data_buffer */
+		if (!hdr_data->info_len || !hdr_data->info)
+			goto e_free;
+
+		ret = -ENOMEM;
+		info = kzalloc(hdr_data->info_len, GFP_KERNEL);
+		if (!info)
+			goto e_free;
+
+		/* save info vaddr */
+		info_vaddr = hdr_data->info;
+
+		ret = -EFAULT;
+		/* copy multiple data info from user */
+		if (copy_from_user(info, (void *)info_vaddr,
+						   hdr_data->info_len))
+			goto e_free;
+
+		info_data = (struct sev_data_multi_data_info_item *)info;
+		count = hdr_data->info_len / sizeof(struct sev_data_multi_data_info_item);
+
+		ret = -ENOMEM;
+		pinned_pages.item = kzalloc(count * sizeof(struct sev_pinned_pages_item), GFP_KERNEL);
+		if (!pinned_pages.item)
+			goto e_free;
+
+		ret = __sev_get_multi_data_info(kvm, info_data, count, &pinned_pages);
+		if (ret)
+			goto e_unpin;
+
+		hdr_data->info = __sme_set(__pa(info));
+
+		/* Guest_address is not used if the multi_data flag set,
+		 * but still set here for FW correct */
+		data->guest_address = info_data[0].guest_hpa;
+		data->guest_length  = params.guest_length;
+
+		/* check the flag for multiple sev devices */
+		if (hdr_data->flags & SEV_HDR_FLAG_MULTI_PSP_MASK) {
+			uint32_t data_array_len;
+			uint32_t item_num;
+
+			ret = -EINVAL;
+			if (!hdr_data->item_num || count < hdr_data->item_num)
+				goto e_unpin;
+			item_num = hdr_data->item_num;
+
+			ret = -ENOMEM;
+			data_array_len = sizeof(struct sev_data_receive_update_data) * item_num;
+			data_array = kzalloc(data_array_len, GFP_KERNEL);
+			if (!data_array)
+				goto e_unpin;
+
+			hdr_array = kzalloc(sizeof(struct sev_data_update_data_hdr) * item_num,
+					    GFP_KERNEL);
+			if (!hdr_array)
+				goto e_unpin;
+
+			/* split a command to a command vector for multiple sev devices */
+			ret = __sev_receive_update_data_new_cmd_vec(data, hdr_data, info,
+								    data_array, hdr_array);
+			if (ret)
+				goto e_unpin;
+
+			/* e. send sev cmd to sev firmware */
+			ret = sev_issue_cmd_vec(kvm, SEV_CMD_RECEIVE_UPDATE_DATA, data_array,
+						data_array_len, &argp->error);
+		} else {
+			/* e. send sev cmd to sev firmware */
+			ret = sev_issue_cmd(kvm, SEV_CMD_RECEIVE_UPDATE_DATA, data, &argp->error);
+		}
+
+		/* restore info vaddr */
+		hdr_data->info = info_vaddr;
+	} else {
+		/*  Check if we are crossing the page boundry */
+		ret = -EINVAL;
+		offset = params.guest_address & (PAGE_SIZE - 1);
+		if ((params.guest_length + offset) > PAGE_SIZE)
+			goto e_free;
+
+		/* d. handle with the guest data memory */
+		/* pin the guest memory region */
+		pages = sev_pin_memory(kvm, params.guest_address & PAGE_MASK,
+							   params.guest_length, &n, 1);
+		if (!pages) {
+			ret = -ENOMEM;
+			goto e_free;
+		}
+
+		data->guest_address = __sme_page_pa(pages[0]) + offset;
+		data->guest_length = params.guest_length;
+
+		/*  flush the caches to ensure that DRAM has recent contents */
+		sev_clflush_pages(pages, n);
+
+		/* e. send sev cmd to sev firmware */
+		ret = sev_issue_cmd(kvm, SEV_CMD_RECEIVE_UPDATE_DATA, data, &argp->error);
+	}
+
+e_unpin:
+	if (pinned_pages.num) {
+		for (i = 0; i < count; i++)
+			sev_unpin_memory(kvm, pinned_pages.item[i].pages, pinned_pages.item[i].n);
+	} else {
+		sev_unpin_memory(kvm, pages, n);
+	}
+
+e_free:
+	kfree(pinned_pages.item);
+	kfree(info);
+	kfree(hdr);
+	kfree(trans);
+	kfree(data);
+	kfree(hdr_array);
+	kfree(data_array);
+	return ret;
+}
+
+static int sev_receive_finish(struct kvm *kvm, struct kvm_sev_cmd *argp)
+{
+	struct sev_data_receive_finish *data = NULL;
+	int ret;
+
+	if (!sev_guest(kvm))
+		return -EINVAL;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	/* receive finish */
+	data->handle = sev_get_handle(kvm);
+	ret = sev_issue_cmd(kvm, SEV_CMD_RECEIVE_FINISH, data, &argp->error);
+	if (ret)
+		goto e_free;
+
+e_free:
+	kfree(data);
+	return ret;
+}
+
+static int sev_gm_get_digest(struct kvm *kvm, struct kvm_sev_cmd *argp)
+{
+	void __user *digest = (void __user *)(uintptr_t)argp->data;
+	struct sev_data_gm_get_digest *data;
+	struct kvm_sev_gm_get_digest params;
+	void __user *p = NULL;
+	void *blob = NULL;
+	int ret;
+
+	if (!sev_guest(kvm))
+		return -ENOTTY;
+
+	if (copy_from_user(&params, digest, sizeof(params)))
+		return -EFAULT;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	/* User wants to query the blob length */
+	if (!params.len)
+		goto cmd;
+
+	p = (void __user *)(uintptr_t)params.uaddr;
+	if (p) {
+		if (params.len > SEV_FW_BLOB_MAX_SIZE) {
+			ret = -EINVAL;
+			goto e_free;
+		}
+
+		ret = -ENOMEM;
+		blob = kmalloc(params.len, GFP_KERNEL);
+		if (!blob)
+			goto e_free;
+
+		data->address = __psp_pa(blob);
+		data->len = params.len;
+	}
+
+cmd:
+	data->handle = sev_get_handle(kvm);
+	ret = sev_issue_cmd(kvm, SEV_CMD_GM_GET_DIGEST, data, &argp->error);
+
+	/*
+	 * If we query the session length, FW responded with expected data.
+	 */
+	if (!params.len)
+		goto done;
+
+	if (ret)
+		goto e_free_blob;
+
+	if (blob) {
+		if (copy_to_user(p, blob, params.len))
+			ret = -EFAULT;
+	}
+
+done:
+	params.len = data->len;
+	if (copy_to_user(digest, &params, sizeof(params)))
+		ret = -EFAULT;
+e_free_blob:
+	kfree(blob);
+e_free:
+	kfree(data);
+	return ret;
+}
+
+static int sev_gm_verify_digest(struct kvm *kvm, struct kvm_sev_cmd *argp)
+{
+	void __user *digest = (void __user *)(uintptr_t)argp->data;
+	struct sev_data_gm_verify_digest *data = NULL;
+	struct kvm_sev_gm_verify_digest params;
+	void *digest_blob = NULL;
+	int *error = &argp->error;
+	int ret;
+
+	if (!sev_guest(kvm))
+		return -ENOTTY;
+
+	if (copy_from_user(&params, digest, sizeof(params)))
+		return -EFAULT;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	if (params.uaddr) {
+		digest_blob = psp_copy_user_blob(params.uaddr, params.len);
+		if (IS_ERR(digest_blob)) {
+			ret = PTR_ERR(digest_blob);
+			goto e_free;
+		}
+
+		data->address = __psp_pa(digest_blob);
+		data->len = params.len;
+	}
+
+	data->handle = sev_get_handle(kvm);
+	ret = sev_issue_cmd(kvm, SEV_CMD_GM_VERIFY_DIGEST, data, error);
+	if (ret)
+		goto e_free_digest;
+
+e_free_digest:
+	kfree(digest_blob);
+e_free:
+	kfree(data);
+
+	return ret;
+}
+
+static int sev_get_dev_num(struct kvm *kvm, struct kvm_sev_cmd *argp)
+{
+	void __user *num = (void __user *)(uintptr_t)argp->data;
+	int32_t psp_dev_num;
+	int ret = 0;
+
+	if (!sev_guest(kvm))
+		return -ENOTTY;
+
+	psp_dev_num = sev_get_psp_dev_num();
+
+	if (psp_dev_num < 0) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	if (copy_to_user(num, &psp_dev_num, sizeof(psp_dev_num)))
+		ret = -EFAULT;
+out:
+	return ret;
+}
+
+static int sev_resize_page_enc_bitmap(struct kvm *kvm, unsigned long new_size)
+{
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+	unsigned long *map;
+	unsigned long sz;
+
+	if (sev->page_enc_bmap_size >= new_size)
+		return 0;
+
+	sz = ALIGN(new_size, BITS_PER_LONG) / 8;
+
+	map = vmalloc(sz);
+	if (!map) {
+		pr_err_once("Failed to allocate decrypted bitmap size %lx\n", sz);
+		return -ENOMEM;
+	}
+
+	/* mark the page encrypted (by default) */
+	memset(map, 0xff, sz);
+
+	bitmap_copy(map, sev->page_enc_bmap, sev->page_enc_bmap_size);
+	kvfree(sev->page_enc_bmap);
+
+	sev->page_enc_bmap = map;
+	sev->page_enc_bmap_size = new_size;
+
+	return 0;
+}
+
+static int svm_page_enc_status_hc(struct kvm *kvm, unsigned long gpa,
+				  unsigned long npages, unsigned long enc)
+{
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+	gfn_t gfn_start, gfn_end;
+	int ret;
+
+	if (!npages)
+		return 0;
+
+	gfn_start = gpa_to_gfn(gpa);
+	gfn_end = gfn_start + npages;
+
+	mutex_lock(&kvm->lock);
+	ret = sev_resize_page_enc_bitmap(kvm, gfn_end);
+	if (ret)
+		goto unlock;
+
+	if (enc)
+		__bitmap_set(sev->page_enc_bmap, gfn_start, gfn_end - gfn_start);
+	else
+		__bitmap_clear(sev->page_enc_bmap, gfn_start, gfn_end - gfn_start);
+
+unlock:
+	mutex_unlock(&kvm->lock);
+	return ret;
+}
+
+static int svm_get_page_enc_bitmap(struct kvm *kvm,
+				   struct kvm_page_enc_bitmap *bmap)
+{
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+	unsigned long gfn_start, gfn_end;
+	unsigned long *bitmap;
+	unsigned long sz, i;
+	int ret;
+
+	if (!sev_guest(kvm))
+		return -ENOTTY;
+
+	gfn_start = bmap->start_gfn;
+	gfn_end = gfn_start + bmap->num_pages;
+
+	sz = ALIGN(bmap->num_pages, BITS_PER_LONG) / 8;
+	bitmap = kmalloc(sz, GFP_KERNEL);
+	if (!bitmap)
+		return -ENOMEM;
+
+	memset(bitmap, 0xff, sz); /* by default all pages are marked encrypted */
+
+	mutex_lock(&kvm->lock);
+	if (sev->page_enc_bmap) {
+		i = gfn_start;
+		for_each_clear_bit_from(i, sev->page_enc_bmap,
+				      min(sev->page_enc_bmap_size, gfn_end))
+			clear_bit(i - gfn_start, bitmap);
+	}
+	mutex_unlock(&kvm->lock);
+
+	ret = -EFAULT;
+	if (copy_to_user(bmap->enc_bitmap, bitmap, sz))
+		goto out;
+
+	ret = 0;
+out:
+	kfree(bitmap);
+	return ret;
+}
+
+static int svm_set_page_enc_bitmap(struct kvm *kvm,
+				   struct kvm_page_enc_bitmap *bmap)
+{
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+	unsigned long gfn_start, gfn_end;
+	unsigned long *bitmap;
+	unsigned long sz, i;
+	int ret;
+
+	if (!sev_guest(kvm))
+		return -ENOTTY;
+
+	gfn_start = bmap->start_gfn;
+	gfn_end = gfn_start + bmap->num_pages;
+
+	sz = ALIGN(bmap->num_pages, BITS_PER_LONG) / 8;
+	bitmap = kmalloc(sz, GFP_KERNEL);
+	if (!bitmap)
+		return -ENOMEM;
+
+	ret = -EFAULT;
+	if (copy_from_user(bitmap, bmap->enc_bitmap, sz))
+		goto out;
+
+	mutex_lock(&kvm->lock);
+	ret = sev_resize_page_enc_bitmap(kvm, gfn_end);
+	if (ret)
+		goto unlock;
+
+	i = gfn_start;
+	for_each_clear_bit_from(i, bitmap, (gfn_end - gfn_start))
+		clear_bit(i + gfn_start, sev->page_enc_bmap);
+
+	ret = 0;
+unlock:
+	mutex_unlock(&kvm->lock);
+out:
+	kfree(bitmap);
+	return ret;
+}
+
+static void svm_flush_log_dirty(struct kvm *kvm)
+{
+	/* Lets make sure caches are flushed to ensure
+	 * that guest data has been written into the memory.
+	 */
+	if (sev_guest(kvm))
+		wbinvd_on_all_cpus();
 }
 
 static int svm_mem_enc_op(struct kvm *kvm, void __user *argp)
@@ -7003,6 +8292,33 @@ static int svm_mem_enc_op(struct kvm *kvm, void __user *argp)
 		break;
 	case KVM_SEV_LAUNCH_SECRET:
 		r = sev_launch_secret(kvm, &sev_cmd);
+		break;
+	case KVM_SEV_SEND_START:
+		r = sev_send_start(kvm, &sev_cmd);
+		break;
+	case KVM_SEV_SEND_UPDATE_DATA:
+		r = sev_send_update_data(kvm, &sev_cmd);
+		break;
+	case KVM_SEV_SEND_FINISH:
+		r = sev_send_finish(kvm, &sev_cmd);
+		break;
+	case KVM_SEV_RECEIVE_START:
+		r = sev_receive_start(kvm, &sev_cmd);
+		break;
+	case KVM_SEV_RECEIVE_UPDATE_DATA:
+		r = sev_receive_update_data(kvm, &sev_cmd);
+		break;
+	case KVM_SEV_RECEIVE_FINISH:
+		r = sev_receive_finish(kvm, &sev_cmd);
+		break;
+	case KVM_SEV_GM_GET_DIGEST:
+		r = sev_gm_get_digest(kvm, &sev_cmd);
+		break;
+	case KVM_SEV_GM_VERIFY_DIGEST:
+		r = sev_gm_verify_digest(kvm, &sev_cmd);
+		break;
+	case KVM_SEV_GET_SEV_DEV_NUM:
+		r = sev_get_dev_num(kvm, &sev_cmd);
 		break;
 	default:
 		r = -EINVAL;
@@ -7270,6 +8586,11 @@ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
 	.mem_enc_unreg_region = svm_unregister_enc_region,
 
 	.need_emulation_on_page_fault = svm_need_emulation_on_page_fault,
+
+	.page_enc_status_hc = svm_page_enc_status_hc,
+	.get_page_enc_bitmap = svm_get_page_enc_bitmap,
+	.set_page_enc_bitmap = svm_set_page_enc_bitmap,
+	.flush_log_dirty = svm_flush_log_dirty
 };
 
 static int __init svm_init(void)

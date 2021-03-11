@@ -27,6 +27,7 @@
 #endif
 
 #define SEV_FW_BLOB_MAX_SIZE	0x4000	/* 16KB */
+#define CSV_FW_MAX_SIZE		0x80000	/* 512KB */
 
 /**
  * SEV platform state
@@ -87,6 +88,17 @@ enum sev_cmd {
 	SEV_CMD_DBG_DECRYPT		= 0x060,
 	SEV_CMD_DBG_ENCRYPT		= 0x061,
 
+	/* Guest exchange data commands */
+	SEV_CMD_GM_PUBKEY_GEN		= 0x070,
+	SEV_CMD_GM_GET_DIGEST		= 0x071,
+	SEV_CMD_GM_VERIFY_DIGEST	= 0x072,
+
+	/* SEV log commands */
+	SEV_CMD_REGISTER_LOG        = 0x080,
+	SEV_CMD_UNREGISTER_LOG      = 0x081,
+	SEV_CMD_SET_LOG_LEVEL       = 0x082,
+	SEV_CMD_GET_LOG_LEVEL       = 0x083,
+
 	SEV_CMD_MAX,
 };
 
@@ -143,14 +155,16 @@ struct sev_data_download_firmware {
 } __packed;
 
 /**
- * struct sev_data_get_id - GET_ID command parameters
+ * struct csv_get_id_cmd_buf - GET_ID command parameters
  *
- * @address: physical address of region to place unique CPU ID(s)
- * @len: len of the region
+ * @address: the address of id userd for return
+ * @length: the length of id
+ *
  */
-struct sev_data_get_id {
-	u64 address;				/* In */
-	u32 len;				/* In/Out */
+struct sev_get_id_cmd_buf
+{
+	u64 address; /* Out */
+	u32 length;  /* In */
 } __packed;
 /**
  * struct sev_data_pdh_cert_export - PDH_CERT_EXPORT command parameters
@@ -218,32 +232,32 @@ struct sev_data_guest_status {
  * @handle: handle assigned to the VM
  * @policy: guest launch policy
  * @dh_cert_address: physical address of DH certificate blob
- * @dh_cert_len: len of DH certificate blob
+ * @dh_cert_length: length of DH certificate blob
  * @session_address: physical address of session parameters
- * @session_len: len of session parameters
+ * @session_len: length of session parameters
  */
 struct sev_data_launch_start {
 	u32 handle;				/* In/Out */
 	u32 policy;				/* In */
 	u64 dh_cert_address;			/* In */
-	u32 dh_cert_len;			/* In */
+	u32 dh_cert_length;			/* In */
 	u32 reserved;				/* In */
-	u64 session_address;			/* In */
-	u32 session_len;			/* In */
+	u64 session_data_address;		/* In */
+	u32 session_data_length;		/* In */
 } __packed;
 
 /**
  * struct sev_data_launch_update_data - LAUNCH_UPDATE_DATA command parameter
  *
  * @handle: handle of the VM to update
- * @len: len of memory to be encrypted
+ * @length: length of memory to be encrypted
  * @address: physical address of memory region to encrypt
  */
 struct sev_data_launch_update_data {
 	u32 handle;				/* In */
 	u32 reserved;
 	u64 address;				/* In */
-	u32 len;				/* In */
+	u32 length;				/* In */
 } __packed;
 
 /**
@@ -257,7 +271,7 @@ struct sev_data_launch_update_vmsa {
 	u32 handle;				/* In */
 	u32 reserved;
 	u64 address;				/* In */
-	u32 len;				/* In */
+	u32 length;				/* In */
 } __packed;
 
 /**
@@ -265,13 +279,13 @@ struct sev_data_launch_update_vmsa {
  *
  * @handle: handle of the VM to process
  * @address: physical address containing the measurement blob
- * @len: len of measurement blob
+ * @length: length of measurement blob
  */
 struct sev_data_launch_measure {
 	u32 handle;				/* In */
 	u32 reserved;
 	u64 address;				/* In */
-	u32 len;				/* In/Out */
+	u32 length;				/* In/Out */
 } __packed;
 
 /**
@@ -279,23 +293,23 @@ struct sev_data_launch_measure {
  *
  * @handle: handle of the VM to process
  * @hdr_address: physical address containing the packet header
- * @hdr_len: len of packet header
+ * @hdr_length: length of packet header
  * @guest_address: system physical address of guest memory region
- * @guest_len: len of guest_paddr
+ * @guest_length: length of guest_paddr
  * @trans_address: physical address of transport memory buffer
- * @trans_len: len of transport memory buffer
+ * @trans_length: length of transport memory buffer
  */
 struct sev_data_launch_secret {
 	u32 handle;				/* In */
 	u32 reserved1;
 	u64 hdr_address;			/* In */
-	u32 hdr_len;				/* In */
+	u32 hdr_length;				/* In */
 	u32 reserved2;
 	u64 guest_address;			/* In */
-	u32 guest_len;				/* In */
+	u32 guest_length;			/* In */
 	u32 reserved3;
 	u64 trans_address;			/* In */
-	u32 trans_len;				/* In */
+	u32 trans_length;			/* In */
 } __packed;
 
 /**
@@ -313,28 +327,28 @@ struct sev_data_launch_finish {
  * @handle: handle of the VM to process
  * @policy: policy information for the VM
  * @pdh_cert_address: physical address containing PDH certificate
- * @pdh_cert_len: len of PDH certificate
+ * @pdh_cert_length: length of PDH certificate
  * @plat_certs_address: physical address containing platform certificate
- * @plat_certs_len: len of platform certificate
- * @amd_certs_address: physical address containing AMD certificate
- * @amd_certs_len: len of AMD certificate
- * @session_address: physical address containing Session data
- * @session_len: len of session data
+ * @plat_certs_length: length of platform certificate
+ * @vendor_certs_address: physical address containing AMD/Higon certificate
+ * @vendor_certs_length: length of AMD/Higon certificate
+ * @session_data_address: physical address containing Session data
+ * @session_length: length of session data
  */
 struct sev_data_send_start {
-	u32 handle;				/* In */
-	u32 policy;				/* Out */
+	u32 handle;						/* In */
+	u32 policy;						/* Out */
 	u64 pdh_cert_address;			/* In */
-	u32 pdh_cert_len;			/* In */
+	u32 pdh_cert_length;			/* In */
 	u32 reserved1;
 	u64 plat_cert_address;			/* In */
-	u32 plat_cert_len;			/* In */
+	u32 plat_cert_length;			/* In */
 	u32 reserved2;
-	u64 amd_cert_address;			/* In */
-	u32 amd_cert_len;			/* In */
+	u64 vendor_cert_address;		/* In */
+	u32 vendor_cert_length;			/* In */
 	u32 reserved3;
 	u64 session_address;			/* In */
-	u32 session_len;			/* In/Out */
+	u32 session_length;			/* In/Out */
 } __packed;
 
 /**
@@ -342,23 +356,23 @@ struct sev_data_send_start {
  *
  * @handle: handle of the VM to process
  * @hdr_address: physical address containing packet header
- * @hdr_len: len of packet header
+ * @hdr_length: length of packet header
  * @guest_address: physical address of guest memory region to send
- * @guest_len: len of guest memory region to send
+ * @guest_length: length of guest memory region to send
  * @trans_address: physical address of host memory region
- * @trans_len: len of host memory region
+ * @trans_length: length of host memory region
  */
 struct sev_data_send_update_data {
 	u32 handle;				/* In */
 	u32 reserved1;
 	u64 hdr_address;			/* In */
-	u32 hdr_len;				/* In/Out */
+	u32 hdr_length;				/* In/Out */
 	u32 reserved2;
 	u64 guest_address;			/* In */
-	u32 guest_len;				/* In */
+	u32 guest_length;			/* In */
 	u32 reserved3;
 	u64 trans_address;			/* In */
-	u32 trans_len;				/* In */
+	u32 trans_length;				/* In */
 } __packed;
 
 /**
@@ -366,22 +380,22 @@ struct sev_data_send_update_data {
  *
  * @handle: handle of the VM to process
  * @hdr_address: physical address containing packet header
- * @hdr_len: len of packet header
+ * @hdr_length: length of packet header
  * @guest_address: physical address of guest memory region to send
- * @guest_len: len of guest memory region to send
+ * @guest_length: length of guest memory region to send
  * @trans_address: physical address of host memory region
- * @trans_len: len of host memory region
+ * @trans_length: length of host memory region
  */
 struct sev_data_send_update_vmsa {
 	u32 handle;				/* In */
 	u64 hdr_address;			/* In */
-	u32 hdr_len;				/* In/Out */
+	u32 hdr_length;				/* In/Out */
 	u32 reserved2;
 	u64 guest_address;			/* In */
-	u32 guest_len;				/* In */
+	u32 guest_length;			/* In */
 	u32 reserved3;
 	u64 trans_address;			/* In */
-	u32 trans_len;				/* In */
+	u32 trans_length;				/* In */
 } __packed;
 
 /**
@@ -398,18 +412,18 @@ struct sev_data_send_finish {
  *
  * @handle: handle of the VM to perform receive operation
  * @pdh_cert_address: system physical address containing PDH certificate blob
- * @pdh_cert_len: len of PDH certificate blob
- * @session_address: system physical address containing session blob
- * @session_len: len of session blob
+ * @pdh_cert_length: length of PDH certificate blob
+ * @session_data_address: system physical address containing session blob
+ * @session_data_length: length of session blob
  */
 struct sev_data_receive_start {
-	u32 handle;				/* In/Out */
-	u32 policy;				/* In */
+	u32 handle;						/* In/Out */
+	u32 policy;						/* In */
 	u64 pdh_cert_address;			/* In */
-	u32 pdh_cert_len;			/* In */
-	u32 reserved1;
-	u64 session_address;			/* In */
-	u32 session_len;			/* In */
+	u32 pdh_cert_length;			/* In */
+	u32 reserved;
+	u64 session_data_address;		/* In */
+	u32 session_data_length;		/* In */
 } __packed;
 
 /**
@@ -417,23 +431,23 @@ struct sev_data_receive_start {
  *
  * @handle: handle of the VM to update
  * @hdr_address: physical address containing packet header blob
- * @hdr_len: len of packet header
+ * @hdr_length: length of packet header
  * @guest_address: system physical address of guest memory region
- * @guest_len: len of guest memory region
+ * @guest_length: length of guest memory region
  * @trans_address: system physical address of transport buffer
- * @trans_len: len of transport buffer
+ * @trans_length: length of transport buffer
  */
 struct sev_data_receive_update_data {
 	u32 handle;				/* In */
 	u32 reserved1;
 	u64 hdr_address;			/* In */
-	u32 hdr_len;				/* In */
+	u32 hdr_length;				/* In */
 	u32 reserved2;
 	u64 guest_address;			/* In */
-	u32 guest_len;				/* In */
+	u32 guest_length;			/* In */
 	u32 reserved3;
 	u64 trans_address;			/* In */
-	u32 trans_len;				/* In */
+	u32 trans_length;			/* In */
 } __packed;
 
 /**
@@ -441,23 +455,23 @@ struct sev_data_receive_update_data {
  *
  * @handle: handle of the VM to update
  * @hdr_address: physical address containing packet header blob
- * @hdr_len: len of packet header
+ * @hdr_length: length of packet header
  * @guest_address: system physical address of guest memory region
- * @guest_len: len of guest memory region
+ * @guest_length: length of guest memory region
  * @trans_address: system physical address of transport buffer
- * @trans_len: len of transport buffer
+ * @trans_length: length of transport buffer
  */
 struct sev_data_receive_update_vmsa {
 	u32 handle;				/* In */
 	u32 reserved1;
 	u64 hdr_address;			/* In */
-	u32 hdr_len;				/* In */
+	u32 hdr_length;				/* In */
 	u32 reserved2;
 	u64 guest_address;			/* In */
-	u32 guest_len;				/* In */
+	u32 guest_length;			/* In */
 	u32 reserved3;
 	u64 trans_address;			/* In */
-	u32 trans_len;				/* In */
+	u32 trans_length;				/* In */
 } __packed;
 
 /**
@@ -475,15 +489,115 @@ struct sev_data_receive_finish {
  * @handle: handle of the VM to perform debug operation
  * @src_addr: source address of data to operate on
  * @dst_addr: destination address of data to operate on
- * @len: len of data to operate on
+ * @length: length of data to operate on
  */
 struct sev_data_dbg {
 	u32 handle;				/* In */
 	u32 reserved;
 	u64 src_addr;				/* In */
 	u64 dst_addr;				/* In */
-	u32 len;				/* In */
+	u32 length;				/* In */
+};
+
+/**
+ * struct sev_log_buffer
+ * SEV_CMD_REGISTER_LOG
+ * command parameters
+ *
+ * @log_buffer_address: physical address of log buffer
+ * @log_buffer_length: length of log buffer
+ */
+struct sev_log_buffer {
+	u64 log_buffer_address;		/* In */
+	u32 log_buffer_length;		/* In */
+};
+
+/**
+ * struct sev_log_level
+ * SEV_CMD_SET_LOG_LEVEL
+ * command parameters
+ *
+ * @log_level: log level (1 - 4: ERROR, WARNING, INFO, DEBUG)
+ */
+struct sev_log_level {
+    u32 log_level;  /* In */
+};
+
+/**
+ * struct sev_data_gm_pubkey_gen - GM_PUBKEY_GEN command parameters
+ *
+ * @key_id_address: physical address containing key id
+ * @key_id_len: len of key id
+ * @pubkey_address: physical address containing GM public key
+ * @pubkey_len: len of GM public key
+ */
+struct sev_data_gm_pubkey_gen {
+	u64 key_id_address;		/* In */
+	u32 key_id_len;			/* In */
+	u32 reserved;
+	u64 pubkey_address;		/* In */
+	u32 pubkey_len;			/* In/Out */
 } __packed;
+
+/**
+ * struct sev_data_gm_get_digest - GM_GET_DIGEST command parameters
+ *
+ * @handle: handle of the VM to process
+ * @address: physical address containing the digest blob
+ * @len: len of digest blob
+ */
+struct sev_data_gm_get_digest {
+	u32 handle;				/* In */
+	u32 reserved;
+	u64 address;			/* In */
+	u32 len;				/* In/Out */
+} __packed;
+
+/**
+ * struct sev_data_gm_verify_digest - GM_VERIFY_DIGEST command parameters
+ *
+ * @handle: handle of the VM to verify
+ * @address: physical address containing the digest blob
+ * @len: len of digest blob
+ */
+struct sev_data_gm_verify_digest {
+	u32 handle;		/* In */
+	u32 reserved;
+	u64 address;	/* In */
+	u32 len;		/* In */
+} __packed;
+
+/**
+ * struct sev_data_multi_data_info_item - multiple data information
+ *
+ * @guest_hpa: host physical address containing the guest data
+ * @guest_gpa: guset physical address corresponding to guest_hpa
+ * @guest_len: len of the guest data
+ */
+struct sev_data_multi_data_info_item {
+	u64 guest_hpa;
+	u64 guest_gpa;
+	u32 guest_len;
+};
+
+struct sev_data_update_data_hdr {
+	u32 flags;
+	union {
+		struct {
+			u8 iv[16];
+			u8 mac[32];
+		};
+		struct {
+			u32 item_num;
+			u64 iv_array_addr;
+			u32 iv_array_len;
+			u64 mac_array_addr;
+			u32 mac_array_len;
+		};
+	};
+	u32 info_len;
+	u64 info;
+}__packed;
 
 #ifdef CONFIG_CRYPTO_DEV_SP_PSP
 
@@ -539,6 +653,31 @@ int sev_platform_status(struct sev_user_data_status *status, int *error);
  */
 int sev_issue_cmd_external_user(struct file *filep, unsigned int id,
 				void *data, int *error);
+
+/**
+ * sev_issue_cmd_vec_external_user - issue SEV command vector by other driver with a file
+ * handle.
+ *
+ * This function can be used by other drivers to issue a SEV command on
+ * behalf of userspace. The caller must pass a valid SEV file descriptor
+ * so that we know that it has access to SEV device.
+ *
+ * @filep - SEV device file pointer
+ * @cmd - command to issue
+ * @data - command vector buffer
+ * @len - command vector buffer len
+ * @error: SEV command return code
+ *
+ * Returns:
+ * 0 if the SEV successfully processed the command
+ * -%ENODEV    if the SEV device is not available
+ * -%ENOTSUPP  if the SEV does not support SEV
+ * -%ETIMEDOUT if the SEV command timed out
+ * -%EIO       if the SEV returned a non-zero return code
+ * -%EINVAL    if the SEV file descriptor is not valid
+ */
+int sev_issue_cmd_vec_external_user(struct file *filep, unsigned int id,
+				void *data, int len, int *error);
 
 /**
  * sev_guest_deactivate - perform SEV DEACTIVATE command
@@ -601,6 +740,10 @@ int sev_guest_decommission(struct sev_data_decommission *data, int *error);
 
 void *psp_copy_user_blob(u64 __user uaddr, u32 len);
 
+int sev_get_psp_dev_num(void);
+
+void *psp_copy_user_csv_fw(u64 __user uaddr, u32 len);
+
 #else	/* !CONFIG_CRYPTO_DEV_SP_PSP */
 
 static inline int
@@ -622,7 +765,14 @@ static inline int sev_guest_df_flush(int *error) { return -ENODEV; }
 static inline int
 sev_issue_cmd_external_user(struct file *filep, unsigned int id, void *data, int *error) { return -ENODEV; }
 
+static inline int
+sev_issue_cmd_vec_external_user(struct file *filep, unsigned int id, void *data, int len, int *error) { return -ENODEV; }
+
 static inline void *psp_copy_user_blob(u64 __user uaddr, u32 len) { return ERR_PTR(-EINVAL); }
+
+static inline int sev_get_psp_dev_num(void) {  }
+
+static inline void *psp_copy_user_csv_fw(u64 __user uaddr, u32 len) { return ERR_PTR(-EINVAL); }
 
 #endif	/* CONFIG_CRYPTO_DEV_SP_PSP */
 
